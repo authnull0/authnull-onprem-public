@@ -45,3 +45,4 @@ API-Test-Report.xlsx
 # a Firebase key grants send-to-any-device on the whole project and cannot be scoped down.
 secrets/
 *-service-account.json
+.env
