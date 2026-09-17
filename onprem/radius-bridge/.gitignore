@@ -1,0 +1,6 @@
+# Built at release time by build.sh, never committed: nothing else in this repository
+# is a binary, and 6MB per revision is not reviewable. Reproducible from the commit id
+# recorded in BUILD-INFO.
+authnull-radius-mfa-linux-*
+SHA256SUMS
+BUILD-INFO

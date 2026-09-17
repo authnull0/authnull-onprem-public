@@ -1,0 +1,808 @@
+# =============================================================================
+# authnull — Full Stack Docker Compose
+#
+# Dev:  docker compose up --build          (reads .env)
+# Prod: docker compose --env-file .env.prod up
+#
+# Rebuild one service:  docker compose up --build authnull-service
+# With SSI/authn:       docker compose --profile ssi --profile authn up --build
+#
+# CHANGES FROM ORIGINAL FILE:
+#   1. Network was declared as "authnull-network" at the top level but every
+#      service referenced "authnull-dev-net" -> renamed top-level network to
+#      "authnull-dev-net" so `docker compose up` no longer errors with
+#      "service ... uses an undefined network".
+#   2. did-react depended on authnull-service with `condition: service_healthy`,
+#      but authnull-service had no healthcheck defined -> added a healthcheck
+#      to authnull-service (curl against :8080) so that condition is valid.
+#      If your image has no /healthz-style endpoint, swap the test command or
+#      change did-react's condition back to `service_started`.
+#   3. auth-log-volume, cassandra-data, and es-data were mounted by
+#      authn-service, cassandra, and elasticsearch respectively but were never
+#      declared in the top-level `volumes:` block -> added them.
+#   4. Ports for postgres, redis, cassandra, and elasticsearch are still
+#      published to the host for dev convenience. See the note at the bottom
+#      of this file — for a VM/onprem deploy you likely want to remove these
+#      `ports:` mappings and rely on the internal network only.
+# =============================================================================
+
+networks:
+  authnull-dev-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  redis-data:
+  authnull-logs:
+  authnull-uploads:
+  authnull-recordings:
+  auth-log-volume:
+  cassandra-data:
+  es-data:
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # Postgres
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    restart: always
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: kloudone
+      POSTGRES_DB: authnull_dev
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./db-init:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - authnull-dev-net
+
+  # ---------------------------------------------------------------------------
+  # did-schema-init — one-shot org-database bootstrap
+  #
+  # Mounting ./db-init into postgres seeds ONLY the master database ($DB_NAME).
+  # Org provisioning connects per-organisation via
+  # GetConnectiontoDatabaseDynamically(<orgName>), so the org database needs the
+  # same schema or the first provisioned org writes into an empty database.
+  #
+  # Mirrors did-schema-init in the reference deployment. Runs to completion and
+  # stays exited; re-running `up` is safe because every step is guarded.
+  # ---------------------------------------------------------------------------
+  did-schema-init:
+    image: postgres:16-alpine
+    restart: "no"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      DB_USER: ${DB_USER}
+      DB_NAME: ${DB_NAME}
+      # The org database is named after the organisation, because provisioning
+      # connects via GetConnectiontoDatabaseDynamically(<orgName>). This MUST
+      # match ORG_NAME, or you get two databases and one of them stays empty.
+      ORG_DB: ${ORG_NAME}
+      SYSTEM_IP: ${SYSTEM_IP:-}
+      # Rewrites tenant site_url to http://$SYSTEM_IP/<sub> on insert. Only wanted
+      # when no real domain fronts the deployment. Off by default: with an empty
+      # SYSTEM_IP the trigger would write "http:///<sub>", and with a real domain
+      # it would overwrite correct URLs with a bare IP.
+      FIX_TENANT_URL: ${FIX_TENANT_URL:-false}
+    volumes:
+      - ./db-init:/db-init:ro
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        echo "did-schema-init: master=$$DB_NAME org=$$ORG_DB"
+
+        if psql -h postgres -U "$$DB_USER" -d postgres -tAc \
+             "SELECT 1 FROM pg_database WHERE datname='$$ORG_DB'" | grep -q 1; then
+          echo "org database $$ORG_DB already exists, leaving it alone"
+        else
+          echo "creating org database $$ORG_DB"
+          psql -h postgres -U "$$DB_USER" -d postgres -c "CREATE DATABASE \"$$ORG_DB\";"
+          echo "importing schema into $$ORG_DB"
+          psql -v ON_ERROR_STOP=1 -h postgres -U "$$DB_USER" -d "$$ORG_DB" -f /db-init/01_schema.sql
+        fi
+
+        # postgres only runs /docker-entrypoint-initdb.d on a FIRST-boot empty
+        # volume, so on an existing volume the master can still be schema-less.
+        if psql -h postgres -U "$$DB_USER" -d "$$DB_NAME" -tAc \
+             "SELECT 1 FROM information_schema.tables WHERE table_schema='did' AND table_name='organizations'" \
+             | grep -q 1; then
+          echo "master $$DB_NAME already has the did schema"
+        else
+          echo "applying schema to master $$DB_NAME"
+          psql -v ON_ERROR_STOP=1 -h postgres -U "$$DB_USER" -d "$$DB_NAME" -f /db-init/01_schema.sql
+        fi
+
+        if [ "$$FIX_TENANT_URL" = "true" ] && [ -n "$$SYSTEM_IP" ]; then
+          echo "installing fix_tenant_url trigger on $$ORG_DB (SYSTEM_IP=$$SYSTEM_IP)"
+          psql -v ON_ERROR_STOP=1 -h postgres -U "$$DB_USER" -d "$$ORG_DB" -c "
+            CREATE OR REPLACE FUNCTION fix_tenant_url() RETURNS TRIGGER AS \$$\$$
+            BEGIN
+              NEW.site_url := 'http://$$SYSTEM_IP/' || split_part(NEW.site_url, '.', 2);
+              RETURN NEW;
+            END; \$$\$$ LANGUAGE plpgsql;
+            DROP TRIGGER IF EXISTS trigger_fix_tenant_url ON did.tenants;
+            CREATE TRIGGER trigger_fix_tenant_url BEFORE INSERT ON did.tenants
+              FOR EACH ROW EXECUTE FUNCTION fix_tenant_url();"
+        else
+          echo "fix_tenant_url trigger skipped (FIX_TENANT_URL=$$FIX_TENANT_URL)"
+        fi
+
+        # Idempotent migrations, applied to the master AND every org database on every
+        # `up`. Deliberately NOT guarded: both branches above only fire on a fresh
+        # volume or a schema-less master, so on an existing deployment neither runs and
+        # any DDL added later would never land anywhere. Every file under
+        # /db-init/migrations is written CREATE ... IF NOT EXISTS, so replaying it is
+        # free and no ledger table is needed.
+        #
+        # Only databases that already carry the `did` schema are touched, so this never
+        # invents the schema somewhere it does not belong.
+        for DB in $$(psql -h postgres -U "$$DB_USER" -d postgres -tAc \
+              "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres'"); do
+          if ! psql -h postgres -U "$$DB_USER" -d "$$DB" -tAc \
+                 "SELECT 1 FROM information_schema.schemata WHERE schema_name='did'" | grep -q 1; then
+            echo "migrations: skipping $$DB (no did schema)"
+            continue
+          fi
+          for F in /db-init/migrations/*.sql; do
+            [ -f "$$F" ] || continue
+            echo "migrations: $$(basename $$F) -> $$DB"
+            psql -v ON_ERROR_STOP=1 -h postgres -U "$$DB_USER" -d "$$DB" -f "$$F"
+          done
+        done
+
+        echo "did-schema-init: done"
+    networks:
+      - authnull-dev-net
+
+  # ---------------------------------------------------------------------------
+  # Redis
+  # ---------------------------------------------------------------------------
+  redis:
+    image: redis:7-alpine
+    restart: always
+    ports:
+      - "6379:6379"
+    command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
+    environment:
+      REDIS_REPLICATION_MODE: master
+      ALLOW_EMPTY_PASSWORD: "no"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      REDIS_PORT: 6379
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - authnull-dev-net
+
+  # ---------------------------------------------------------------------------
+  # Authnz — token validation sidecar
+  # ---------------------------------------------------------------------------
+  authnz:
+    image: docker-repo-public.authnull.com/authnz:1.0.0
+    restart: always
+    ports:
+      - "6066:6066"
+    environment:
+      SERVER_PORT: "6066"
+      # Postgres config
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      DB_SCHEMA: ${DB_SCHEMA}
+      # Redis config
+      REDIS_HOST: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      GIN_MODE: ${GIN_MODE}
+      # Internal Service.
+      # The okta getsession endpoint is served by the consolidated
+      # authnull-service (mfa module, mounted at /authentication), NOT by a
+      # standalone mfa-service. The previous value "onprem-mfa-service-1" was a
+      # container name from the 32-service reference deployment; on this stack it
+      # does not resolve (SERVFAIL), and authnz exits on the failed lookup rather
+      # than returning an error, so nginx reports 502.
+      OKTA_URL: http://authnull-service:8080/authentication/okta/getsession
+    networks:
+      - authnull-dev-net
+
+  # ---------------------------------------------------------------------------
+  # ssi-service — DID / SSI / credential engine  (--profile ssi)
+  # ---------------------------------------------------------------------------
+  ssi-service:
+    image: docker-repo-public.authnull.com/ssi-service:1.0.0-onprem
+    restart: always
+    ports:
+      - "5000:5000"
+    environment:
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      DB_SCHEMA: ${DB_SCHEMA}
+      #service
+      SERVICES_STORAGE_PROVIDER: redis
+      SERVICES_STORAGE_ADDRESS: "0.0.0.0:6379"
+      SERVICES_STORAGE_PASSWORD: "${REDIS_PASSWORD}"
+      # Alternative format seen in logs
+      STORAGE_PROVIDER: redis
+      STORAGE_ADDRESS: "0.0.0.0:6379"
+      STORAGE_PASSWORD: "${REDIS_PASSWORD}"
+      # Redis config
+      REDIS_HOST: 0.0.0.0
+      REDIS_PORT: "6379"
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+    networks:
+      - authnull-dev-net
+
+  # ---------------------------------------------------------------------------
+  # authn-service — full auth engine  (--profile authn)
+  # ---------------------------------------------------------------------------
+  authn-service:
+    image: docker-repo-public.authnull.com/authn-service:1.0.0
+    restart: always
+    ports:
+      - "2882:2882"
+    environment:
+      # Postgres config
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      DB_SCHEMA: ${DB_SCHEMA}
+      # Redis config
+      REDIS_HOST: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      #service
+      SERVER_PORT: "2882"
+      SERVER_BASEPATH: "/authnull0"
+      KAFKA_BROKERS: "10.104.14.189:9092"
+      KAFKA_TOPIC: "audit-log"
+      VERIFIER_SERVER_URL: ${SYSTEM_URL}
+      LOGGER_PATH: "/var/log"
+      FLUENTLOG_PATH: "/logs/auth.log"
+      IPINFO_TOKEN: ${IPINFO_TOKEN}
+      # Internal services
+      #
+      # These addressed user-service:8000 and policy-service:7079 until the consolidation. Neither
+      # is defined in this file any more -- both were dissolved into authnull-service -- so every
+      # one of these lookups was pointed at a host that does not resolve, and authn-service could
+      # not answer an authentication on-prem at all. Re-pointed at the consolidated service.
+      #
+      # The four unauthenticated ones work as-is: tenant/routes.go and user/routes.go both apply
+      # AuthnzMiddleware partway down the file, and all four of these sit above that line.
+      TENANT_URL: http://authnull-service:8080/api/v1/tenant/getTenantDetail
+      TENANT_GETUSERDETAILURL: http://authnull-service:8080/api/v1/tenant/getUserDetailFromAuthService
+      TENANT_GETENDPOINTDETAILURL: http://authnull-service:8080/api/v1/user/getEndpointandUserDetail
+      TENANT_GETWALLETUSERDETAILURL: http://authnull-service:8080/api/v1/user/getWalletUserDetail
+      #
+      # Policy and audit need INTERNAL_API_KEY below: they are served behind
+      # middleware.InternalKeyOrAuthnz, since nginx proxies all of /api/ and an unauthenticated
+      # mount would be an anonymous policy read and audit write open to the internet.
+      #
+      # TENANT_POLICY addresses the JSON engine, NOT /policyService/SearchPolicy. The legacy handler
+      # reads did.auth_policies while policies are authored into did.auth_policy_json, so it answers
+      # about a different table -- returning an empty list rather than an error, which reads as "no
+      # policy covers this user" and lets the login through unchallenged.
+      #
+      # It also had no effect until now: nothing in authn-service read TENANT_POLICY, and the URL
+      # was a literal naming onprem.prod.authnull.com in two places. See src/utils/internal_client.go.
+      TENANT_POLICY: http://authnull-service:8080/api/v1/policy/json/searchPolicy
+      TENANT_AUDIT: http://authnull-service:8080/api/v1/policy/logAccessRequest
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY}
+      #
+      # Provider config is stored AES-encrypted in did.ad_mfa_provider_config, written by
+      # authnull-service's admin console and read here. Both keys are needed and both must match
+      # that service: ENCRYPTION_KEY is canonical, TOTP_ENCRYPTION_KEY is a read-only fallback for
+      # rows written before the keys were unified. Missing either presents as "MFA is broken"
+      # rather than "a key is not set".
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY}
+      #
+      # Unset deliberately: no SsoLogin route survives in either repo, so there is nothing to point
+      # this at. CallSsoLogin now fails as "not configured" instead of calling a dead host -- if
+      # that arm turns out to still be needed, it needs an implementation, not an address.
+      TENANT_SSO: ""
+      #
+      # Unchanged: secret-management-service is still defined in this file.
+      TENANT_GETCREDENTIALS: http://secret-management-service:9291/api/v1/secretservice/getCredentials
+      #
+      # aipolicyagent is NOT defined in this file. If it does not run here, risk scoring must fail
+      # explicitly rather than silently degrade -- see the open question in the plan.
+      RISK_API_INTERNAL: http://aipolicyagent:8002/api/v1/ai
+    volumes:
+      - auth-log-volume:/logs
+    networks:
+      - authnull-dev-net
+
+  # ---------------------------------------------------------------------------
+  # authnull-service — consolidated backend
+  # ---------------------------------------------------------------------------
+  authnull-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: docker-repo-public.authnull.com/authnull-service:1.0.0
+    restart: always
+    ports:
+      - "8080:8080"
+    environment:
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      DB_SCHEMA: ${DB_SCHEMA}
+      MASTER_DB: ${DB_NAME}
+      # Connection pool, PER DATABASE. This service opens one pool per organisation plus one for
+      # the master, so the ceiling it can demand is (orgs + 1) x DB_MAX_OPEN_CONNS -- and that has
+      # to fit inside Postgres max_connections minus the reserved slots minus every other service
+      # on the box. Defaults are 20/5; raise them only together with max_connections, or put a
+      # pooler in front once the tenant count grows.
+      DB_MAX_OPEN_CONNS: ${DB_MAX_OPEN_CONNS}
+      DB_MAX_IDLE_CONNS: ${DB_MAX_IDLE_CONNS}
+      REDIS_HOST: redis:6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      SERVER_PORT: "8080"
+      ENV: ${ENV}
+      GIN_MODE: ${GIN_MODE}
+      CORS_ALLOW_ORIGIN: "*"
+      AUTHNZ_URL: http://authnz:6066/authnz/authenticate
+      AUTH_DISABLED: "false"
+      ENCRYPTION_KEY: ${ENCRYPTION_KEY}
+      TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY}
+      JWT_SECRET: ${JWT_SECRET}
+      DID_SERVICE_ADDR: ssi-service:50051
+      SSI_SERVICE: http://ssi-service:5000
+      AUTHN_SERVICE_URL: http://authn-service:2882
+      UI_URL: http://ui:3000
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_FROM: ${SMTP_FROM}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      ROOT_URL: ${ROOT_URL}
+      SSC_BASE_URL: ${SSC_BASE_URL}
+      AUTHNULL_LOGOUT_URL: ${AUTHNULL_LOGOUT_URL}
+      CLIENT_URL: ${CLIENT_URL}
+      VERIFY_URL: ${SYSTEM_URL}/api/v1/tenants/orgsignupverify
+      OKTA_IDP_METADATA_URL: ${OKTA_IDP_METADATA_URL}
+      MFA_PROVIDER: ${MFA_PROVIDER}
+      DUO_IKEY: ${DUO_IKEY}
+      DUO_SKEY: ${DUO_SKEY}
+      DUO_HOST: ${DUO_HOST}
+      OKTA_DOMAIN: ${OKTA_DOMAIN}
+      OKTA_API_TOKEN: ${OKTA_API_TOKEN}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
+      TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER}
+      EXPO_ACCESS_TOKEN: ${EXPO_ACCESS_TOKEN}
+      # AuthNull Authenticator (Flutter) push transport. Required only when an org's
+      # MFA_PROVIDER is "authnull"; the legacy Expo app needs neither.
+      #
+      # FCM_SERVICE_ACCOUNT_JSON is path-or-inline: a value starting with '{' is the
+      # credential itself, anything else is a path. For a path, mount the file
+      # read-only into this container. FCM_PROJECT_ID is optional and defaults to
+      # project_id inside the credential.
+      FCM_SERVICE_ACCOUNT_JSON: ${FCM_SERVICE_ACCOUNT_JSON}
+      FCM_PROJECT_ID: ${FCM_PROJECT_ID}
+      # Comma-separated ingress CIDRs. Unset means gin trusts NO proxy, so c.ClientIP()
+      # returns the socket peer instead of a client-supplied X-Forwarded-For entry.
+      TRUSTED_PROXIES: ${TRUSTED_PROXIES}
+      # Challenge lifetime. 60s to match the DC sensor's mfa_timeout_seconds exactly.
+      # Raising this WITHOUT raising the sensor and gateway timeouts means the app shows a
+      # countdown longer than the login will actually wait — the user approves and the
+      # sign-in has already failed.
+      MFA_PUSH_CHALLENGE_TTL_SEC: ${MFA_PUSH_CHALLENGE_TTL_SEC}
+      # Geo lookup for the "where is this login from" line. off | api.
+      # Defaults to off: on-prem is a first-class target and AD client IPs are almost
+      # always RFC1918, which nothing can resolve anyway.
+      MFA_GEOIP_MODE: ${MFA_GEOIP_MODE}
+      MFA_GEOIP_API_URL: ${MFA_GEOIP_API_URL}
+      MFA_GEOIP_TIMEOUT_MS: ${MFA_GEOIP_TIMEOUT_MS}
+      # Risk scoring. Leave false until the activity table has ~a week of rows: every rule
+      # is relative to a user's own history, so on an empty table the scores are noise.
+      MFA_PUSH_RISK_ENABLED: ${MFA_PUSH_RISK_ENABLED}
+      MFA_PUSH_RISK_LOOKBACK_DAYS: ${MFA_PUSH_RISK_LOOKBACK_DAYS}
+      # Activity retention. Set MFA_PUSH_SWEEP_ENABLED=true on EXACTLY ONE replica —
+      # there is no leader election here.
+      MFA_PUSH_ACTIVITY_RETENTION_DAYS: ${MFA_PUSH_ACTIVITY_RETENTION_DAYS}
+      MFA_PUSH_SWEEP_ENABLED: ${MFA_PUSH_SWEEP_ENABLED}
+      # Fraud alert on denial, with a cooldown so MFA-bombing cannot become inbox-bombing.
+      MFA_PUSH_ALERT_TO: ${MFA_PUSH_ALERT_TO}
+      MFA_PUSH_ALERT_COOLDOWN_MIN: ${MFA_PUSH_ALERT_COOLDOWN_MIN}
+      # Response-signature enforcement. EMPTY MEANS ENFORCED, and so does any unparseable value,
+      # so a typo fails secure. Forwarded so the knob is reachable at all: it was read by the code
+      # but absent here, which meant setting it in .env did nothing -- and an operator who saw no
+      # effect would have gone looking for a way to force it, arriving at the unsafe state anyway
+      # but with no idea why. Visible and defaulted-secure beats hidden.
+      MFA_PUSH_ALLOW_UNSIGNED: ${MFA_PUSH_ALLOW_UNSIGNED}
+      # Email -> org lookup for the app's manual-entry path. An account-enumeration oracle, so it
+      # is off unless this is explicitly true; disabled and unknown-address return identical 404s.
+      ORG_DISCOVERY_ENABLED: ${ORG_DISCOVERY_ENABLED}
+      # Whole-request timeout for the inline authorization call, seconds. Unset = 5s. Measured
+      # round trip on this deployment is ~0.6s, so 5s is ~8x headroom; raise only if authnz gets
+      # genuinely slower. It cannot be disabled -- 0 or a non-number falls back to the default.
+      AUTHNZ_TIMEOUT_SEC: ${AUTHNZ_TIMEOUT_SEC}
+      WEBAUTHN_RP_NAME: ${WEBAUTHN_RP_NAME}
+      WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID}
+      WEBAUTHN_ORIGIN: ${WEBAUTHN_ORIGIN}
+      AZURE_STORAGE_ACCOUNT: ${AZURE_STORAGE_ACCOUNT}
+      AZURE_STORAGE_KEY: ${AZURE_STORAGE_KEY}
+      AZURE_CONTAINER_NAME: ${AZURE_CONTAINER_NAME}
+      FLUENT_LOG_PATH: /var/log/authnull/auth.log
+      LOGGER_PATH: /var/log/authnull/audit.log
+      ETHEREUM_URL: ${ETHEREUM_URL}
+      REDIS_PORT: ${REDIS_PORT:-6379}
+      AI_SERVICE_API_KEY: ${AI_SERVICE_API_KEY}
+      INTERNAL_API_KEY: ${INTERNAL_API_KEY}
+      INSTALL_SCRIPT_URL: ${INSTALL_SCRIPT_URL}
+      AUTHNULL_UPLINK_URL: ${AUTHNULL_UPLINK_URL}
+      APP_IOS_URL: ${APP_IOS_URL}
+      APP_ANDROID_URL: ${APP_ANDROID_URL}
+      LOGGING_URL: ${LOGGING_URL}
+      SSO_VERIFICATION_URL: ${SSO_VERIFICATION_URL}
+      VAULT_SERVICE_URL: ${VAULT_SERVICE_URL}
+      TENANT_SERVICE_URL: ${TENANT_SERVICE_URL}
+      # --- vars the code reads that were previously never passed through -------
+      # SSC_URL backs the /ssc/signin redirect. SYSTEM_URL is no longer used by
+      # the Go code (the pam loopback calls it backed are now direct calls); it is
+      # still referenced by the ui service block below.
+      SYSTEM_URL: ${SYSTEM_URL}
+      # Tenant base domain: provisioning builds tenants.site_url as
+      # default.<org>.${TENANT_BASE_DOMAIN}. Must match what nginx/DNS serve,
+      # or tenant login cannot resolve the tenant. Unset => prod.authnull.com.
+      TENANT_BASE_DOMAIN: ${TENANT_BASE_DOMAIN}
+      # "false" => wallet pairing is not required to finish onboarding; the console
+      # offers TOTP/Passkey instead. See internal/mfa/handler/login.go.
+      WALLET_ONBOARDING_REQUIRED: ${WALLET_ONBOARDING_REQUIRED}
+      # Loopback base for the in-binary credential API (wallet -> issuer), which cannot
+      # be an in-process call without an import cycle.
+      INTERNAL_API_BASE_URL: ${INTERNAL_API_BASE_URL:-http://localhost:8080}
+      SSC_URL: ${SSC_URL}
+      # Baked into the downloadable AD agent and sensor config files, so these
+      # must be reachable from the agent host. Unset, they defaulted to the SaaS
+      # endpoints (https://api.authnull.com, https://policy.authnull.com), which
+      # handed on-prem agents the wrong server.
+      # The API root the mobile app is told to call -- it travels inside every invite QR and push
+      # payload. Empty is fine: appurl.API() falls back to SYSTEM_URL, which is also passed below.
+      # This used to be hardcoded to ${SYSTEM_URL}, which meant the API_BASE_URL line in .env did
+      # nothing at all and an operator overriding it would have seen no effect.
+      API_BASE_URL: ${API_BASE_URL}
+      AD_SERVICE_URL: ${SYSTEM_URL}
+      POLICY_SERVICE_URL: ${SYSTEM_URL}
+      # (CREATE_AD_USER_CREDENTIAL_V2 / CREATE_SHARED_AD_USER_CREDENTIAL removed --
+      # the ad module now calls the issuer directly instead of over loopback HTTP.)
+      # authn-service base; the code appends
+      # /authnull0/api/v1/authn/v3/do-authenticationV4. Unset, it fell back to
+      # http://onprem.authnull.com.
+      DO_AUTHNV4: http://authn-service:2882
+      SMTP_BCC: ${SMTP_BCC}
+      # pam file-upload storage (restored: the standalone service read these
+      # directly, and conf.applyEnvOverrides now bridges them into Viper).
+      CSV_BASEPATH: /var/authnull/uploads/csv
+      LDIF_BASEPATH: /var/authnull/uploads/ldif
+      LOCAL_STORAGE_ENABLED: "true"
+    volumes:
+      - authnull-logs:/var/log/authnull
+      - authnull-uploads:/var/authnull/uploads
+      - authnull-recordings:/var/authnull/recordings
+      # Firebase service account for push MFA, read-only.
+      #
+      # A bind-mounted FILE, not the inline JSON in .env: .env is committed in this repo, and a
+      # Firebase key cannot be scoped down -- it grants send-to-any-device across the whole
+      # project, so it must not enter git. ./secrets is gitignored.
+      #
+      # Without this mount FCM_SERVICE_ACCOUNT_JSON points at a path the container cannot see,
+      # newFCMSender fails once at first use, and every push silently never arrives.
+      - ./secrets/fcm-service-account.json:/run/secrets/fcm-service-account.json:ro
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/system/v1/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    networks:
+      - authnull-dev-net
+
+  # ---------------------------------------------------------------------------
+  # ui — React admin console
+  # ---------------------------------------------------------------------------
+  did-react:
+    image: docker-repo-public.authnull.com/authnull-admin-ui:2.0.0
+    restart: always
+    ports:
+      - "5173:3000"
+    environment:
+      #REACT_APP_ENV: ${ENV}
+      REACT_APP_API_URL: ${SYSTEM_URL}
+      REACT_APP_URL: /
+      REACT_APP_PAM_API_URL: ${SYSTEM_URL}/pam/api/v1
+      REACT_APP_TENANTS_API_URL: ${SYSTEM_URL}/api/v1/tenants
+      REACT_APP_SAM_API_URL: ${SYSTEM_URL}/api/v1/service-accounts
+      REACT_APP_AI_API_URL: ${SYSTEM_URL}/api/v1/ai
+      REACT_APP_JUMPSERVER_CONNECTION_PORT: "8080"
+      REACT_APP_TENANT_ID: ${TENANT_ID}
+      REACT_APP_ORG_NAME: ${ORG_NAME}
+      REACT_APP_REDIRECT_URL: ${DOMAIN_URL}
+      REACT_APP_AUTHENTICATION_URL: ${SSC_SIGNIN_URL}
+      REACT_APP_DID_API_URL: ${SYSTEM_URL}/api/v1
+      REACT_APP_POLICY_API_URL: ${SYSTEM_URL}/api/v1/policyService
+      REACT_APP_AD_GATEWAY_URL: ${SYSTEM_URL}/ad
+    networks:
+      - authnull-dev-net
+    depends_on:
+      authnull-service:
+        condition: service_healthy
+
+  self-service-console:
+    image: docker-repo-public.authnull.com/self-service:1.0.0
+    restart: always
+    ports:
+     - "3000:3000"
+    environment:
+      SERVER_PORT: "3000"
+      REACT_APP_BASE_URL: ${SYSTEM_URL}
+      REACT_APP_API_TENANTS_URL: ${SYSTEM_URL}/api/v1/tenants
+      # Postgres config
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      DB_SCHEMA: ${DB_SCHEMA}
+    networks:
+      - authnull-dev-net
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  secret-management-service:
+    image: docker-repo-public.authnull.com/secret-management-service:1.0.0
+    restart: always
+    ports:
+     - "9291:9291"
+    environment:
+      SERVER_PORT: "9291"
+     # Postgres config
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      DB_SCHEMA: ${DB_SCHEMA}
+      # Internal services
+      AUTHNZ_URL: http://authnz:6066/authnz/authenticate
+      DO_AUTHN_V4: http://authn-service:2882/authnull0/api/v1/authn/v3/do-authenticationV4
+    networks:
+      - authnull-dev-net
+
+  logworkflows:
+    image: docker-repo-public.authnull.com/log-workflows:1.0.0
+    restart: always
+    ports:
+     - "8086:8080"
+    depends_on:
+     temporal:
+      condition: service_healthy
+    environment:
+     SERVER_PORT: "8080"
+     TEMPORAL_HOST: temporal:7233
+     TEMPORAL_NAMESPACE: default
+     TEMPORAL_TLS_ENABLED: "false"
+     #Internal Service
+     PAM_SERVICE: http://pam-service:9090
+     POLICY_SERVICE: http://policy-service:7079
+    networks:
+      - authnull-dev-net
+
+  log-service:
+    image: docker-repo-public.authnull.com/log-service:1.0.0
+    restart: always
+    ports:
+     - "9255:9255"
+    environment:
+      SERVER_PORT: "9255"
+      IPINFO_TOKEN: ${IPINFO_TOKEN}
+      #Postgres config
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      DB_SCHEMA: ${DB_SCHEMA}
+      # Redis
+      REDIS_HOST: redis
+      REDIS_PASSWORD: ${REDIS_PASSWORD}
+      # Internal services
+      AUTHNZ_URL: http://authnz:6066/authnz/authenticate
+    networks:
+      - authnull-dev-net
+
+  transaction-log-daemon:
+    image: docker-repo-public.authnull.com/transaction-log-daemon:1.0.0
+    restart: always
+    ports:
+     - "8087:8080"
+    environment:
+     SERVER_PORT: "8080"
+     CRON_TIME: "1h"
+     # Postgres config
+     DB_HOST: ${DB_HOST}
+     DB_PORT: ${DB_PORT}
+     DB_USER: ${DB_USER}
+     DB_PASSWORD: ${DB_PASSWORD}
+     DB_NAME: ${DB_NAME}
+     DB_SCHEMA: ${DB_SCHEMA}
+    networks:
+      - authnull-dev-net
+
+  blockchain-ipfs-logging:
+   image: docker-repo-public.authnull.com/blockchain-ipfs-logging:1.0.0
+   restart: always
+   ports:
+     - "6065:6065"
+   environment:
+     SERVER_PORT: "6065"
+     CORS_ALLOW_ORIGIN: "*"
+     OKTA_APP: https://dev-10065336.okta.com/app/dev-10065336_appauth_1/exk9qlowj2pMhgIgL5d7/sso/saml
+     # Postgres config
+     DB_HOST: postgres
+     DB_PORT: "5432"
+     DB_USER: kloudone
+     DB_PASSWORD: ${POSTGRES_PASSWORD}
+     DB_NAME: authnull_dev
+     DB_SCHEMA: did
+     # SMTP config
+     SMTP_HOST: ${SMTP_HOST}
+     SMTP_PORT: ${SMTP_PORT}
+     SMTP_FROM: ${SMTP_FROM}
+     SMTP_PASSWORD: ${SMTP_PASSWORD}
+     #Internal Service
+     AUTHNZ_URL: http://authnz:6066/authnz/authenticate
+   networks:
+      - authnull-dev-net
+
+  cassandra:
+   image: cassandra:3.11
+   container_name: cassandra
+   ports:
+    - "9042:9042"
+   environment:
+    CASSANDRA_CLUSTER_NAME: temporal
+    CASSANDRA_DC: datacenter1
+    CASSANDRA_RACK: rack1
+    CASSANDRA_START_RPC: "true"
+    CASSANDRA_RPC_ADDRESS: "0.0.0.0"
+    CASSANDRA_BROADCAST_ADDRESS: cassandra
+   volumes:
+    - cassandra-data:/var/lib/cassandra
+   healthcheck:
+    test: ["CMD-SHELL", "cqlsh cassandra 9042 -e 'DESCRIBE KEYSPACES'"]
+    interval: 20s
+    timeout: 10s
+    retries: 15
+    start_period: 90s
+   networks:
+     - authnull-dev-net
+
+  cassandra-init:
+   image: cassandra:3.11
+   depends_on:
+     cassandra:
+       condition: service_healthy
+   restart: "no"
+   command: >
+     sh -c "
+        echo 'Waiting for Cassandra to be ready...' &&
+        sleep 10 &&
+        echo 'Creating temporal keyspace...' &&
+        cqlsh cassandra 9042 -e \"CREATE KEYSPACE IF NOT EXISTS temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': 1};\" &&
+        echo 'Keyspace created successfully!'
+      "
+   networks:
+     - authnull-dev-net
+
+  elasticsearch:
+   image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
+   container_name: elasticsearch
+   restart: unless-stopped
+   environment:
+    - discovery.type=single-node
+    - xpack.security.enabled=false
+    - ES_JAVA_OPTS=-Xms512m -Xmx512m
+   ports:
+    - "9200:9200"
+   volumes:
+    - es-data:/usr/share/elasticsearch/data
+   networks:
+     - authnull-dev-net
+
+  temporal:
+   image: temporalio/auto-setup:1.29.1
+   container_name: temporal
+   restart: unless-stopped
+   depends_on:
+    cassandra:
+      condition: service_healthy
+    cassandra-init:
+      condition: service_completed_successfully
+    elasticsearch:
+      condition: service_started
+   ports:
+    - "7233:7233"
+   environment:
+    CASSANDRA_SEEDS: cassandra
+    CASSANDRA_PORT: 9042
+    ELASTICSEARCH_SEEDS: elasticsearch
+    ELASTICSEARCH_PORT: 9200
+    SKIP_DB_CREATE: false
+    TEMPORAL_ADDRESS: "temporal:7233"
+    ENABLE_ES: "true"
+    ES_SEEDS: elasticsearch
+    ES_PORT: "9200"
+    ES_VERSION: "v7"
+   healthcheck:
+    test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "temporal:7233"]
+    interval: 30s
+    timeout: 10s
+    retries: 10
+    start_period: 180s
+   networks:
+    - authnull-dev-net
+
+# =============================================================================
+# NOT FIXED — decide and edit yourself before deploying to the VM:
+#
+# 1. TWILIO_FROM_NUMBER is read by authnull-service but your .env only has
+#    TWILIO_PHONE. Add TWILIO_FROM_NUMBER=+18554251760 to .env (or rename).
+#
+# 2. FIXED: SSC_SIGNIN_URL (used by did-react's REACT_APP_AUTHENTICATION_URL)
+#    was missing from .env, so REACT_APP_AUTHENTICATION_URL rendered as an empty
+#    string and the UI had no sign-in target. Now set alongside CLIENT_URL,
+#    SSC_BASE_URL and AUTHNULL_LOGOUT_URL -- all of which must point at THIS
+#    deployment. Setting SYSTEM_URL alone is not sufficient.
+#
+# 3. FIXED (onprem-mfa-service-1): authnz's OKTA_URL pointed at that container,
+#    a name from the 32-service reference deployment. It SERVFAILed here and
+#    authnz exited on the failed lookup, so nginx returned 502 on
+#    /authnz/getUserDetails. Now points at authnull-service, which serves
+#    /authentication/okta/getsession from the consolidated mfa module.
+#
+#    Still referenced but not defined here: aipolicyagent, user-service,
+#    policy-service, pam-service, jumpserver. user-service, policy-service and
+#    pam-service are all consolidated INTO authnull-service, so any remaining
+#    reference to them by hostname is stale and should be repointed the same way.
+#    aipolicyagent and jumpserver are genuinely separate; if they run in another
+#    stack, attach them to "authnull-dev-net" (external: true) or their hostnames
+#    will not resolve.
+#
+# 4. For an internet-facing VM, strongly consider dropping the host `ports:`
+#    mappings on postgres (5432), redis (6379), cassandra (9042), and
+#    elasticsearch (9200) — elasticsearch here also has security disabled.
+#    Keep them reachable only via authnull-dev-net and put your reverse proxy
+#    in front of just the UI/API ports (8080, 3000, 5173, etc.).
+#
+# 5. minio and the AWS-recordings integration have .env values set but no
+#    corresponding service/wiring in this file — confirm that's intentional.
+# =============================================================================
