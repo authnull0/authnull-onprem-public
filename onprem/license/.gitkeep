@@ -1,6 +1,0 @@
-Drop a licence file here as authnull.lic to install it before first boot.
-
-Only needed for an air-gapped install. Everyone else uploads it in the console
-(Settings -> Licence), which stores it in the database and survives upgrades.
-
-An empty directory is normal: with no licence the deployment runs a 30-day trial.
