@@ -9,9 +9,9 @@
 #
 # CHANGES FROM ORIGINAL FILE:
 #   1. Network was declared as "authnull-network" at the top level but every
-#      service referenced "authnull-dev-net" -> renamed top-level network to
-#      "authnull-dev-net" so `docker compose up` no longer errors with
-#      "service ... uses an undefined network".
+#      service referenced a different name -> the top-level network and every
+#      service reference now use "authnull" so `docker compose up`
+#      no longer errors with "service ... uses an undefined network".
 #   2. did-react depended on authnull-service with `condition: service_healthy`,
 #      but authnull-service had no healthcheck defined -> added a healthcheck
 #      to authnull-service (curl against :8080) so that condition is valid.
@@ -20,18 +20,45 @@
 #   3. auth-log-volume, cassandra-data, and es-data were mounted by
 #      authn-service, cassandra, and elasticsearch respectively but were never
 #      declared in the top-level `volumes:` block -> added them.
-#   4. Ports for postgres, redis, cassandra, and elasticsearch are still
-#      published to the host for dev convenience. See the note at the bottom
-#      of this file — for a VM/onprem deploy you likely want to remove these
-#      `ports:` mappings and rely on the internal network only.
+#   4. Ports for postgres, redis, and cassandra are now bound to 127.0.0.1
+#      only (reachable from the VM itself, not from the internet). Internal
+#      service ports are bound to 127.0.0.1 as well. Docker bypasses ufw, so
+#      a plain "5432:5432" mapping is open to the internet even with ufw on.
+#   5. postgres (Bitnami image) now persists to /bitnami/postgresql on the
+#      new postgres-bitnami-data volume. The old postgres-data volume holds
+#      data from the previous postgres:16-alpine image and is kept as backup.
+#   6. did-schema-init waits for Postgres to accept real TCP logins before
+#      running (Bitnami reports healthy during first-boot init).
+#   7. authnull-service MASTER_DB and blockchain-ipfs-logging DB settings now
+#      follow DB_USER / DB_NAME from .env instead of hardcoded kloudone values.
+#   8. ssi-service Redis address fixed: 0.0.0.0 inside a container is the
+#      container itself, not Redis.
 # =============================================================================
 
+# Project name: every container is named authnull-<service>-<n>
+# (e.g. authnull-postgres-1), independent of the folder this file lives in.
+# NOTE: COMPOSE_PROJECT_NAME=onprem in .env overrides this, so containers are
+# actually named onprem-<service>-<n>.
+name: authnull
+
+# Shared restart policy, merged into services with  <<: *restart
+x-restart: &restart
+  restart: unless-stopped
+
 networks:
-  authnull-dev-net:
+  authnull:
+    # Explicit name so the Docker network is "authnull", not "authnull_authnull".
+    name: authnull
     driver: bridge
+    ipam:
+      config:
+        - subnet: 10.250.0.0/24
+
 
 volumes:
-  postgres-data:
+  postgres-data:            # OLD postgres:16-alpine data, kept as backup, unused
+  pgdata:
+  postgres-bitnami-data:    # current Postgres data (Bitnami layout)
   redis-data:
   authnull-logs:
   authnull-uploads:
@@ -46,16 +73,17 @@ services:
   # Postgres
   # ---------------------------------------------------------------------------
   postgres:
+    <<: *restart
     image: postgres:16-alpine
-    restart: always
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     environment:
-      POSTGRES_USER: kloudone
-      POSTGRES_DB: authnull_dev
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_DB: ${DB_NAME}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
     volumes:
-      - postgres-data:/var/lib/postgresql/data
+      # Bitnami stores data under /bitnami/postgresql, NOT /var/lib/postgresql/data.
+      - pgdata:/var/lib/postgresql/data
       - ./db-init:/docker-entrypoint-initdb.d
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${DB_USER} -d ${DB_NAME}"]
@@ -63,7 +91,7 @@ services:
       timeout: 5s
       retries: 10
     networks:
-      - authnull-dev-net
+      - authnull
 
   # ---------------------------------------------------------------------------
   # did-schema-init — one-shot org-database bootstrap
@@ -103,6 +131,26 @@ services:
       - -c
       - |
         set -e
+
+        # --- Wait for Postgres to accept real TCP logins -----------------------
+        # The Bitnami image reports "healthy" during first-boot init, before it
+        # accepts connections from other containers, and then restarts itself.
+        # Without this wait, the checks below fail with "Connection refused".
+        echo "did-schema-init: waiting for postgres over TCP..."
+        TRIES=0
+        until pg_isready -h postgres -p 5432 -U "$$DB_USER" -q; do
+          TRIES=$$((TRIES+1)); [ "$$TRIES" -ge 60 ] && { echo "postgres never became reachable"; exit 1; }
+          sleep 2
+        done
+        sleep 5
+        TRIES=0
+        until psql -h postgres -U "$$DB_USER" -d postgres -tAc 'select 1' >/dev/null 2>&1; do
+          TRIES=$$((TRIES+1)); [ "$$TRIES" -ge 60 ] && { echo "cannot log in to postgres as $$DB_USER"; exit 1; }
+          sleep 2
+        done
+        echo "did-schema-init: postgres is ready"
+        # -----------------------------------------------------------------------
+
         echo "did-schema-init: master=$$DB_NAME org=$$ORG_DB"
 
         if psql -h postgres -U "$$DB_USER" -d postgres -tAc \
@@ -166,16 +214,16 @@ services:
 
         echo "did-schema-init: done"
     networks:
-      - authnull-dev-net
+      - authnull
 
   # ---------------------------------------------------------------------------
   # Redis
   # ---------------------------------------------------------------------------
   redis:
+    <<: *restart
     image: redis:7-alpine
-    restart: always
     ports:
-      - "6379:6379"
+      - "127.0.0.1:6379:6379"
     command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
     environment:
       REDIS_REPLICATION_MODE: master
@@ -191,16 +239,16 @@ services:
       retries: 5
       start_period: 10s
     networks:
-      - authnull-dev-net
+      - authnull
 
   # ---------------------------------------------------------------------------
   # Authnz — token validation sidecar
   # ---------------------------------------------------------------------------
   authnz:
+    <<: *restart
     image: docker-repo-public.authnull.com/authnz:1.0.0
-    restart: always
     ports:
-      - "6066:6066"
+      - "127.0.0.1:6066:6066"
     environment:
       SERVER_PORT: "6066"
       # Postgres config
@@ -223,16 +271,16 @@ services:
       # than returning an error, so nginx reports 502.
       OKTA_URL: http://authnull-service:8080/authentication/okta/getsession
     networks:
-      - authnull-dev-net
+      - authnull
 
   # ---------------------------------------------------------------------------
   # ssi-service — DID / SSI / credential engine  (--profile ssi)
   # ---------------------------------------------------------------------------
   ssi-service:
+    <<: *restart
     image: docker-repo-public.authnull.com/ssi-service:1.0.0-onprem
-    restart: always
     ports:
-      - "5000:5000"
+      - "127.0.0.1:5000:5000"
     environment:
       DB_HOST: ${DB_HOST}
       DB_PORT: ${DB_PORT}
@@ -241,28 +289,30 @@ services:
       DB_NAME: ${DB_NAME}
       DB_SCHEMA: ${DB_SCHEMA}
       #service
+      # Was "0.0.0.0:6379": inside a container that is the container itself,
+      # not the redis service. Redis is reachable by its service name.
       SERVICES_STORAGE_PROVIDER: redis
-      SERVICES_STORAGE_ADDRESS: "0.0.0.0:6379"
+      SERVICES_STORAGE_ADDRESS: "redis:6379"
       SERVICES_STORAGE_PASSWORD: "${REDIS_PASSWORD}"
       # Alternative format seen in logs
       STORAGE_PROVIDER: redis
-      STORAGE_ADDRESS: "0.0.0.0:6379"
+      STORAGE_ADDRESS: "redis:6379"
       STORAGE_PASSWORD: "${REDIS_PASSWORD}"
       # Redis config
-      REDIS_HOST: 0.0.0.0
+      REDIS_HOST: redis
       REDIS_PORT: "6379"
       REDIS_PASSWORD: ${REDIS_PASSWORD}
     networks:
-      - authnull-dev-net
+      - authnull
 
   # ---------------------------------------------------------------------------
   # authn-service — full auth engine  (--profile authn)
   # ---------------------------------------------------------------------------
   authn-service:
+    <<: *restart
     image: docker-repo-public.authnull.com/authn-service:1.0.0
-    restart: always
     ports:
-      - "2882:2882"
+      - "127.0.0.1:2882:2882"
     environment:
       # Postgres config
       DB_HOST: ${DB_HOST}
@@ -277,6 +327,8 @@ services:
       #service
       SERVER_PORT: "2882"
       SERVER_BASEPATH: "/authnull0"
+      # NOTE: hardcoded broker on AuthNull's network; the KAFKA_* values in .env
+      # are ignored. Ask AuthNull whether this should be ${KAFKA_BROKERS}.
       KAFKA_BROKERS: "10.104.14.189:9092"
       KAFKA_TOPIC: "audit-log"
       VERIFIER_SERVER_URL: ${SYSTEM_URL}
@@ -334,17 +386,17 @@ services:
     volumes:
       - auth-log-volume:/logs
     networks:
-      - authnull-dev-net
+      - authnull
 
   # ---------------------------------------------------------------------------
   # authnull-service — consolidated backend
   # ---------------------------------------------------------------------------
   authnull-service:
+    <<: *restart
     build:
       context: .
       dockerfile: Dockerfile
     image: docker-repo-public.authnull.com/authnull-service:1.0.0
-    restart: always
     ports:
       - "8080:8080"
     environment:
@@ -354,6 +406,7 @@ services:
       DB_PASSWORD: ${DB_PASSWORD}
       DB_NAME: ${DB_NAME}
       DB_SCHEMA: ${DB_SCHEMA}
+      # The master DATABASE name (ram_db), not a username.
       MASTER_DB: ${DB_NAME}
       # Connection pool, PER DATABASE. This service opens one pool per organisation plus one for
       # the master, so the ceiling it can demand is (orgs + 1) x DB_MAX_OPEN_CONNS -- and that has
@@ -515,6 +568,8 @@ services:
       #
       # Without this mount FCM_SERVICE_ACCOUNT_JSON points at a path the container cannot see,
       # newFCMSender fails once at first use, and every push silently never arrives.
+      # If ./secrets/fcm-service-account.json does not exist, Docker creates an
+      # empty DIRECTORY with that name -- check with: ls -la secrets/
       - ./secrets/fcm-service-account.json:/run/secrets/fcm-service-account.json:ro
     healthcheck:
       test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/system/v1/health"]
@@ -523,14 +578,14 @@ services:
       retries: 10
       start_period: 20s
     networks:
-      - authnull-dev-net
+      - authnull
 
   # ---------------------------------------------------------------------------
   # ui — React admin console
   # ---------------------------------------------------------------------------
   did-react:
+    <<: *restart
     image: docker-repo-public.authnull.com/authnull-admin-ui:2.0.0
-    restart: always
     ports:
       - "5173:3000"
     environment:
@@ -550,16 +605,16 @@ services:
       REACT_APP_POLICY_API_URL: ${SYSTEM_URL}/api/v1/policyService
       REACT_APP_AD_GATEWAY_URL: ${SYSTEM_URL}/ad
     networks:
-      - authnull-dev-net
+      - authnull
     depends_on:
       authnull-service:
         condition: service_healthy
 
   self-service-console:
+    <<: *restart
     image: docker-repo-public.authnull.com/self-service:1.0.0
-    restart: always
     ports:
-     - "3000:3000"
+      - "3000:3000"
     environment:
       SERVER_PORT: "3000"
       REACT_APP_BASE_URL: ${SYSTEM_URL}
@@ -572,19 +627,19 @@ services:
       DB_NAME: ${DB_NAME}
       DB_SCHEMA: ${DB_SCHEMA}
     networks:
-      - authnull-dev-net
+      - authnull
     depends_on:
       postgres:
         condition: service_healthy
 
   secret-management-service:
+    <<: *restart
     image: docker-repo-public.authnull.com/secret-management-service:1.0.0
-    restart: always
     ports:
-     - "9291:9291"
+      - "127.0.0.1:9291:9291"
     environment:
       SERVER_PORT: "9291"
-     # Postgres config
+      # Postgres config
       DB_HOST: ${DB_HOST}
       DB_PORT: ${DB_PORT}
       DB_USER: ${DB_USER}
@@ -595,32 +650,13 @@ services:
       AUTHNZ_URL: http://authnz:6066/authnz/authenticate
       DO_AUTHN_V4: http://authn-service:2882/authnull0/api/v1/authn/v3/do-authenticationV4
     networks:
-      - authnull-dev-net
-
-  logworkflows:
-    image: docker-repo-public.authnull.com/log-workflows:1.0.0
-    restart: always
-    ports:
-     - "8086:8080"
-    depends_on:
-     temporal:
-      condition: service_healthy
-    environment:
-     SERVER_PORT: "8080"
-     TEMPORAL_HOST: temporal:7233
-     TEMPORAL_NAMESPACE: default
-     TEMPORAL_TLS_ENABLED: "false"
-     #Internal Service
-     PAM_SERVICE: http://pam-service:9090
-     POLICY_SERVICE: http://policy-service:7079
-    networks:
-      - authnull-dev-net
+      - authnull
 
   log-service:
+    <<: *restart
     image: docker-repo-public.authnull.com/log-service:1.0.0
-    restart: always
     ports:
-     - "9255:9255"
+      - "127.0.0.1:9255:9255"
     environment:
       SERVER_PORT: "9255"
       IPINFO_TOKEN: ${IPINFO_TOKEN}
@@ -637,172 +673,117 @@ services:
       # Internal services
       AUTHNZ_URL: http://authnz:6066/authnz/authenticate
     networks:
-      - authnull-dev-net
+      - authnull
 
   transaction-log-daemon:
+    <<: *restart
     image: docker-repo-public.authnull.com/transaction-log-daemon:1.0.0
-    restart: always
     ports:
-     - "8087:8080"
+      - "127.0.0.1:8087:8080"
     environment:
-     SERVER_PORT: "8080"
-     CRON_TIME: "1h"
-     # Postgres config
-     DB_HOST: ${DB_HOST}
-     DB_PORT: ${DB_PORT}
-     DB_USER: ${DB_USER}
-     DB_PASSWORD: ${DB_PASSWORD}
-     DB_NAME: ${DB_NAME}
-     DB_SCHEMA: ${DB_SCHEMA}
+      SERVER_PORT: "8080"
+      CRON_TIME: "1h"
+      # Postgres config
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      DB_SCHEMA: ${DB_SCHEMA}
+    depends_on:
+      did-schema-init:
+        condition: service_completed_successfully
     networks:
-      - authnull-dev-net
+      - authnull
 
   blockchain-ipfs-logging:
-   image: docker-repo-public.authnull.com/blockchain-ipfs-logging:1.0.0
-   restart: always
-   ports:
-     - "6065:6065"
-   environment:
-     SERVER_PORT: "6065"
-     CORS_ALLOW_ORIGIN: "*"
-     OKTA_APP: https://dev-10065336.okta.com/app/dev-10065336_appauth_1/exk9qlowj2pMhgIgL5d7/sso/saml
-     # Postgres config
-     DB_HOST: postgres
-     DB_PORT: "5432"
-     DB_USER: kloudone
-     DB_PASSWORD: ${POSTGRES_PASSWORD}
-     DB_NAME: authnull_dev
-     DB_SCHEMA: did
-     # SMTP config
-     SMTP_HOST: ${SMTP_HOST}
-     SMTP_PORT: ${SMTP_PORT}
-     SMTP_FROM: ${SMTP_FROM}
-     SMTP_PASSWORD: ${SMTP_PASSWORD}
-     #Internal Service
-     AUTHNZ_URL: http://authnz:6066/authnz/authenticate
-   networks:
-      - authnull-dev-net
+    <<: *restart
+    image: docker-repo-public.authnull.com/blockchain-ipfs-logging:1.0.0
+    ports:
+      - "127.0.0.1:6065:6065"
+    environment:
+      SERVER_PORT: "6065"
+      CORS_ALLOW_ORIGIN: "*"
+      OKTA_APP: https://dev-10065336.okta.com/app/dev-10065336_appauth_1/exk9qlowj2pMhgIgL5d7/sso/saml
+      # Postgres config (was hardcoded kloudone / authnull_dev, which do not
+      # exist on this Postgres)
+      DB_HOST: ${DB_HOST}
+      DB_PORT: ${DB_PORT}
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+      DB_SCHEMA: ${DB_SCHEMA}
+      # SMTP config
+      SMTP_HOST: ${SMTP_HOST}
+      SMTP_PORT: ${SMTP_PORT}
+      SMTP_FROM: ${SMTP_FROM}
+      SMTP_PASSWORD: ${SMTP_PASSWORD}
+      #Internal Service
+      AUTHNZ_URL: http://authnz:6066/authnz/authenticate
+    networks:
+      - authnull
 
   cassandra:
-   image: cassandra:3.11
-   container_name: cassandra
-   ports:
-    - "9042:9042"
-   environment:
-    CASSANDRA_CLUSTER_NAME: temporal
-    CASSANDRA_DC: datacenter1
-    CASSANDRA_RACK: rack1
-    CASSANDRA_START_RPC: "true"
-    CASSANDRA_RPC_ADDRESS: "0.0.0.0"
-    CASSANDRA_BROADCAST_ADDRESS: cassandra
-   volumes:
-    - cassandra-data:/var/lib/cassandra
-   healthcheck:
-    test: ["CMD-SHELL", "cqlsh cassandra 9042 -e 'DESCRIBE KEYSPACES'"]
-    interval: 20s
-    timeout: 10s
-    retries: 15
-    start_period: 90s
-   networks:
-     - authnull-dev-net
+    <<: *restart
+    image: cassandra:3.11
+    ports:
+      - "127.0.0.1:9042:9042"
+    environment:
+      CASSANDRA_CLUSTER_NAME: temporal
+      CASSANDRA_DC: datacenter1
+      CASSANDRA_RACK: rack1
+      CASSANDRA_START_RPC: "true"
+      CASSANDRA_RPC_ADDRESS: "0.0.0.0"
+      CASSANDRA_BROADCAST_ADDRESS: cassandra
+    volumes:
+      - cassandra-data:/var/lib/cassandra
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh cassandra 9042 -e 'DESCRIBE KEYSPACES'"]
+      interval: 20s
+      timeout: 10s
+      retries: 15
+      start_period: 90s
+    networks:
+      - authnull
 
   cassandra-init:
-   image: cassandra:3.11
-   depends_on:
-     cassandra:
-       condition: service_healthy
-   restart: "no"
-   command: >
-     sh -c "
-        echo 'Waiting for Cassandra to be ready...' &&
-        sleep 10 &&
-        echo 'Creating temporal keyspace...' &&
-        cqlsh cassandra 9042 -e \"CREATE KEYSPACE IF NOT EXISTS temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': 1};\" &&
-        echo 'Keyspace created successfully!'
-      "
-   networks:
-     - authnull-dev-net
+    image: cassandra:3.11
+    depends_on:
+      cassandra:
+        condition: service_healthy
+    restart: "no"
+    command: >
+      sh -c "
+         echo 'Waiting for Cassandra to be ready...' &&
+         sleep 10 &&
+         echo 'Creating temporal keyspace...' &&
+         cqlsh cassandra 9042 -e \"CREATE KEYSPACE IF NOT EXISTS temporal WITH REPLICATION = {'class': 'SimpleStrategy', 'replication_factor': 1};\" &&
+         echo 'Keyspace created successfully!'
+       "
+    networks:
+      - authnull
 
-  elasticsearch:
-   image: docker.elastic.co/elasticsearch/elasticsearch:7.17.10
-   container_name: elasticsearch
-   restart: unless-stopped
-   environment:
-    - discovery.type=single-node
-    - xpack.security.enabled=false
-    - ES_JAVA_OPTS=-Xms512m -Xmx512m
-   ports:
-    - "9200:9200"
-   volumes:
-    - es-data:/usr/share/elasticsearch/data
-   networks:
-     - authnull-dev-net
-
-  temporal:
-   image: temporalio/auto-setup:1.29.1
-   container_name: temporal
-   restart: unless-stopped
-   depends_on:
-    cassandra:
-      condition: service_healthy
-    cassandra-init:
-      condition: service_completed_successfully
-    elasticsearch:
-      condition: service_started
-   ports:
-    - "7233:7233"
-   environment:
-    CASSANDRA_SEEDS: cassandra
-    CASSANDRA_PORT: 9042
-    ELASTICSEARCH_SEEDS: elasticsearch
-    ELASTICSEARCH_PORT: 9200
-    SKIP_DB_CREATE: false
-    TEMPORAL_ADDRESS: "temporal:7233"
-    ENABLE_ES: "true"
-    ES_SEEDS: elasticsearch
-    ES_PORT: "9200"
-    ES_VERSION: "v7"
-   healthcheck:
-    test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "temporal:7233"]
-    interval: 30s
-    timeout: 10s
-    retries: 10
-    start_period: 180s
-   networks:
-    - authnull-dev-net
 
 # =============================================================================
-# NOT FIXED — decide and edit yourself before deploying to the VM:
+# STILL OPEN — decide and edit yourself:
 #
-# 1. TWILIO_FROM_NUMBER is read by authnull-service but your .env only has
-#    TWILIO_PHONE. Add TWILIO_FROM_NUMBER=+18554251760 to .env (or rename).
+# 1. .env is missing JWT_SECRET, INTERNAL_API_KEY and GIN_MODE=release.
+#    Generate the secrets with:  openssl rand -hex 32
 #
-# 2. FIXED: SSC_SIGNIN_URL (used by did-react's REACT_APP_AUTHENTICATION_URL)
-#    was missing from .env, so REACT_APP_AUTHENTICATION_URL rendered as an empty
-#    string and the UI had no sign-in target. Now set alongside CLIENT_URL,
-#    SSC_BASE_URL and AUTHNULL_LOGOUT_URL -- all of which must point at THIS
-#    deployment. Setting SYSTEM_URL alone is not sufficient.
+# 2. TWILIO_FROM_NUMBER is read by authnull-service but .env only has
+#    TWILIO_PHONE. Add TWILIO_FROM_NUMBER to .env if you use SMS.
 #
-# 3. FIXED (onprem-mfa-service-1): authnz's OKTA_URL pointed at that container,
-#    a name from the 32-service reference deployment. It SERVFAILed here and
-#    authnz exited on the failed lookup, so nginx returned 502 on
-#    /authnz/getUserDetails. Now points at authnull-service, which serves
-#    /authentication/okta/getsession from the consolidated mfa module.
+# 3. SSC_SIGNIN_URL, CLIENT_URL, SSC_BASE_URL, AUTHNULL_LOGOUT_URL and ROOT_URL
+#    are NOT in .env yet. All must point at THIS deployment, or the UI has no
+#    working sign-in / logout target.
 #
-#    Still referenced but not defined here: aipolicyagent, user-service,
-#    policy-service, pam-service, jumpserver. user-service, policy-service and
-#    pam-service are all consolidated INTO authnull-service, so any remaining
-#    reference to them by hostname is stale and should be repointed the same way.
-#    aipolicyagent and jumpserver are genuinely separate; if they run in another
-#    stack, attach them to "authnull-dev-net" (external: true) or their hostnames
-#    will not resolve.
+# 4. 8080, 3000 and 5173 are still published on all interfaces (UI / API).
+#    If a reverse proxy on this VM fronts them, change these to
+#    "127.0.0.1:PORT:PORT" too so only the proxy (80/443) is public.
 #
-# 4. For an internet-facing VM, strongly consider dropping the host `ports:`
-#    mappings on postgres (5432), redis (6379), cassandra (9042), and
-#    elasticsearch (9200) — elasticsearch here also has security disabled.
-#    Keep them reachable only via authnull-dev-net and put your reverse proxy
-#    in front of just the UI/API ports (8080, 3000, 5173, etc.).
+# 5. authn-service KAFKA_BROKERS is hardcoded to an AuthNull-internal IP, and
+#    RISK_API_INTERNAL points at aipolicyagent, which is not defined here.
 #
-# 5. minio and the AWS-recordings integration have .env values set but no
+# 6. minio and the AWS-recordings integration have .env values set but no
 #    corresponding service/wiring in this file — confirm that's intentional.
 # =============================================================================
