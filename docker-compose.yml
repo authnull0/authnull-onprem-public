@@ -94,15 +94,19 @@ services:
       - authnull
 
   # ---------------------------------------------------------------------------
-  # did-schema-init — one-shot org-database bootstrap
+  # did-schema-init — one-shot master-schema bootstrap + migrations
   #
-  # Mounting ./db-init into postgres seeds ONLY the master database ($DB_NAME).
-  # Org provisioning connects per-organisation via
-  # GetConnectiontoDatabaseDynamically(<orgName>), so the org database needs the
-  # same schema or the first provisioned org writes into an empty database.
+  # Mounting ./db-init into postgres seeds the master database ($DB_NAME), but
+  # only on a first-boot empty volume; this makes sure the master has the schema
+  # and replays the idempotent migrations on every `up`.
   #
-  # Mirrors did-schema-init in the reference deployment. Runs to completion and
-  # stays exited; re-running `up` is safe because every step is guarded.
+  # It deliberately does NOT create the per-org database. authnull-service's
+  # provisioning cron does that itself (pg_dump of the master, then
+  # CREATE DATABASE <org>) once an org is approved. Pre-creating it here made
+  # that CREATE fail with "database already exists", so the org never got its
+  # tenant row or admin user and login answered "Tenant not found or inactive".
+  #
+  # Runs to completion and stays exited; re-running `up` is safe.
   # ---------------------------------------------------------------------------
   did-schema-init:
     image: postgres:16-alpine
@@ -114,16 +118,6 @@ services:
       PGPASSWORD: ${POSTGRES_PASSWORD}
       DB_USER: ${DB_USER}
       DB_NAME: ${DB_NAME}
-      # The org database is named after the organisation, because provisioning
-      # connects via GetConnectiontoDatabaseDynamically(<orgName>). This MUST
-      # match ORG_NAME, or you get two databases and one of them stays empty.
-      ORG_DB: ${ORG_NAME}
-      SYSTEM_IP: ${SYSTEM_IP:-}
-      # Rewrites tenant site_url to http://$SYSTEM_IP/<sub> on insert. Only wanted
-      # when no real domain fronts the deployment. Off by default: with an empty
-      # SYSTEM_IP the trigger would write "http:///<sub>", and with a real domain
-      # it would overwrite correct URLs with a bare IP.
-      FIX_TENANT_URL: ${FIX_TENANT_URL:-false}
     volumes:
       - ./db-init:/db-init:ro
     entrypoint:
@@ -151,17 +145,7 @@ services:
         echo "did-schema-init: postgres is ready"
         # -----------------------------------------------------------------------
 
-        echo "did-schema-init: master=$$DB_NAME org=$$ORG_DB"
-
-        if psql -h postgres -U "$$DB_USER" -d postgres -tAc \
-             "SELECT 1 FROM pg_database WHERE datname='$$ORG_DB'" | grep -q 1; then
-          echo "org database $$ORG_DB already exists, leaving it alone"
-        else
-          echo "creating org database $$ORG_DB"
-          psql -h postgres -U "$$DB_USER" -d postgres -c "CREATE DATABASE \"$$ORG_DB\";"
-          echo "importing schema into $$ORG_DB"
-          psql -v ON_ERROR_STOP=1 -h postgres -U "$$DB_USER" -d "$$ORG_DB" -f /db-init/01_schema.sql
-        fi
+        echo "did-schema-init: master=$$DB_NAME"
 
         # postgres only runs /docker-entrypoint-initdb.d on a FIRST-boot empty
         # volume, so on an existing volume the master can still be schema-less.
@@ -174,25 +158,10 @@ services:
           psql -v ON_ERROR_STOP=1 -h postgres -U "$$DB_USER" -d "$$DB_NAME" -f /db-init/01_schema.sql
         fi
 
-        if [ "$$FIX_TENANT_URL" = "true" ] && [ -n "$$SYSTEM_IP" ]; then
-          echo "installing fix_tenant_url trigger on $$ORG_DB (SYSTEM_IP=$$SYSTEM_IP)"
-          psql -v ON_ERROR_STOP=1 -h postgres -U "$$DB_USER" -d "$$ORG_DB" -c "
-            CREATE OR REPLACE FUNCTION fix_tenant_url() RETURNS TRIGGER AS \$$\$$
-            BEGIN
-              NEW.site_url := 'http://$$SYSTEM_IP/' || split_part(NEW.site_url, '.', 2);
-              RETURN NEW;
-            END; \$$\$$ LANGUAGE plpgsql;
-            DROP TRIGGER IF EXISTS trigger_fix_tenant_url ON did.tenants;
-            CREATE TRIGGER trigger_fix_tenant_url BEFORE INSERT ON did.tenants
-              FOR EACH ROW EXECUTE FUNCTION fix_tenant_url();"
-        else
-          echo "fix_tenant_url trigger skipped (FIX_TENANT_URL=$$FIX_TENANT_URL)"
-        fi
-
         # Idempotent migrations, applied to the master AND every org database on every
-        # `up`. Deliberately NOT guarded: both branches above only fire on a fresh
-        # volume or a schema-less master, so on an existing deployment neither runs and
-        # any DDL added later would never land anywhere. Every file under
+        # `up`. Deliberately NOT guarded: the master-schema branch above only fires on a
+        # fresh volume or a schema-less master, so on an existing deployment it does not
+        # run and any DDL added later would never land anywhere. Every file under
         # /db-init/migrations is written CREATE ... IF NOT EXISTS, so replaying it is
         # free and no ledger table is needed.
         #
@@ -397,6 +366,17 @@ services:
       context: .
       dockerfile: Dockerfile
     image: docker-repo-public.authnull.com/authnull-service:1.0.0
+    # Start only after the master schema and migrations are in place, so
+    # `docker compose up authnull-service` alone also runs did-schema-init first.
+    # did-schema-init exits non-zero if a migration fails, which then keeps this
+    # service from starting against a half-migrated database.
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      did-schema-init:
+        condition: service_completed_successfully
     ports:
       - "8080:8080"
     environment:
