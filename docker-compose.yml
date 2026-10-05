@@ -592,7 +592,7 @@ services:
 
   self-service-console:
     <<: *restart
-    image: docker-repo-public.authnull.com/self-service:1.0.0
+    image: docker-repo-public.authnull.com/self-service:onprem
     ports:
       - "3000:3000"
     environment:
