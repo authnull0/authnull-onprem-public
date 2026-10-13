@@ -279,7 +279,7 @@ services:
   # ---------------------------------------------------------------------------
   authn-service:
     <<: *restart
-    image: docker-repo-public.authnull.com/authn-service:1.0.0
+    image: docker-repo-public.authnull.com/authn-service:2.0.0
     ports:
       - "127.0.0.1:2882:2882"
     environment:
