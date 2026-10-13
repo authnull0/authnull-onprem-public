@@ -9389,6 +9389,497 @@ ALTER TABLE did.jump_server
     ADD COLUMN IF NOT EXISTS backend_public_key   varchar(1024) NULL,
     ADD COLUMN IF NOT EXISTS ca_public_key        varchar(1024) NULL;
 
+-- ----------------------------------------------------------------------------
+-- 020_ssh_user_certificates.sql
+-- ----------------------------------------------------------------------------
+
+-- Operator SSH certificates, in each ORGANISATION database.
+--
+-- WHAT THIS REPLACES
+--
+-- The SSH proxy used to learn who was connecting from a registered public key
+-- (015_user_ssh_keys.sql): every operator's key had to be uploaded and kept in
+-- step with their laptops. Instead, an operator who has signed in to the console
+-- -- with the console's own SSO and MFA -- asks it to sign whatever key they
+-- already have, and gets back a certificate that names them and expires on its
+-- own. The proxy forwards the certificate; authn-service verifies it against the
+-- CA below and reads the person from it.
+--
+-- TWO DIFFERENT CAs, ON PURPOSE
+--
+-- This is the USER CA: it vouches for PEOPLE, to the proxy. It is not the
+-- gateway CA in /etc/authnull/sshproxy/ca_key, which vouches for the PROXY, to
+-- targets. Targets trust only the gateway CA, so a certificate issued here opens
+-- nothing if presented to a target directly.
+--
+-- ONE ACTIVE CA PER ORGANISATION
+--
+-- Created on first use by the console, never by hand. The partial unique index
+-- makes a second active row unrepresentable, which is what lets two first-ever
+-- requests race: both generate a key, one insert wins, both then read the winner.
+-- retired_at exists so the CA can be rotated later without deleting the row that
+-- signed every certificate in the ledger.
+--
+-- The private key is stored encrypted with the deployment's ENCRYPTION_KEY
+-- (AES-256-GCM, see internal/pam/sshcerts). A database dump alone does not yield
+-- a key that can mint an identity.
+--
+-- THE LEDGER
+--
+-- Every certificate issued, keyed by its serial. It is what makes revocation
+-- possible -- authn-service refuses a certificate whose serial has revoked_at set
+-- -- and it is the audit trail: who asked, for which key, from where, valid when.
+-- Revocation is a timestamp, not a delete, for the same reason as in 015.
+--
+-- Numbered 020, following 019_jump_server_keys.sql. Safe to run repeatedly.
+
+CREATE TABLE IF NOT EXISTS did.ssh_user_ca (
+    id              serial PRIMARY KEY,
+    org_id          integer     NOT NULL,
+    public_key      text        NOT NULL,
+    private_key_enc text        NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    retired_at      timestamptz
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ssh_user_ca_one_active
+    ON did.ssh_user_ca (org_id) WHERE retired_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS did.ssh_user_certs (
+    serial          bigint      PRIMARY KEY,
+    org_id          integer     NOT NULL,
+    ca_id           integer     NOT NULL REFERENCES did.ssh_user_ca (id),
+    user_id         integer     NOT NULL,
+    principal       text        NOT NULL,
+    key_fingerprint text        NOT NULL,
+    valid_after     timestamptz NOT NULL,
+    valid_before    timestamptz NOT NULL,
+    issued_at       timestamptz NOT NULL DEFAULT now(),
+    source_ip       text,
+    revoked_at      timestamptz
+);
+
+CREATE INDEX IF NOT EXISTS ssh_user_certs_by_user
+    ON did.ssh_user_certs (org_id, user_id, issued_at DESC);
+
+-- ----------------------------------------------------------------------------
+-- 021_gateway_credentials.sql
+-- ----------------------------------------------------------------------------
+
+-- Per-gateway client credentials, in each ORGANISATION database.
+--
+-- WHAT THIS REPLACES
+--
+-- Every gateway authenticated to the control plane with the same value: the
+-- stack's INTERNAL_API_KEY, written into every console.env. One key for every
+-- gateway, shared with authn-service, cannot be revoked for one gateway, and a
+-- request carrying it can claim to be any gateway -- the heartbeat and the
+-- recording upload took the jump server id from the request body.
+--
+-- Each gateway now gets its own client id and secret when an administrator
+-- downloads its config. It exchanges them for a short-lived access token
+-- (gateway_tokens) and presents that; the control plane derives the org and
+-- the gateway from the token and refuses a body that names another. This is
+-- also the precondition for releasing anything sensitive to a gateway -- the
+-- vault will hand a reconcile key only to the gateway a job was given to.
+--
+-- SECRETS ARE STORED AS HASHES
+--
+-- secret_hash and token_hash are SHA-256 of 256-bit random values. A slow
+-- password hash buys nothing for values that cannot be guessed, and costs a
+-- hash per heartbeat. A database dump yields neither a usable secret nor a
+-- usable token.
+--
+-- ONE ACTIVE CREDENTIAL PER GATEWAY
+--
+-- Downloading the config again issues a new credential and revokes the old one,
+-- so a leaked console.env is fixed by downloading a fresh one. The partial unique
+-- index makes two live credentials for one gateway unrepresentable. Revocation
+-- is a timestamp, for the audit trail.
+--
+-- Numbered 021, following 020_ssh_user_certificates.sql. Safe to run repeatedly.
+
+CREATE TABLE IF NOT EXISTS did.gateway_credentials (
+    id             serial      PRIMARY KEY,
+    org_id         integer     NOT NULL,
+    jump_server_id integer     NOT NULL,
+    client_id      text        NOT NULL UNIQUE,
+    secret_hash    text        NOT NULL,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    created_by     integer,
+    last_used_at   timestamptz,
+    revoked_at     timestamptz
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS gateway_credentials_one_active
+    ON did.gateway_credentials (org_id, jump_server_id) WHERE revoked_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS did.gateway_tokens (
+    token_hash     text        PRIMARY KEY,
+    credential_id  integer     NOT NULL REFERENCES did.gateway_credentials (id),
+    org_id         integer     NOT NULL,
+    jump_server_id integer     NOT NULL,
+    issued_at      timestamptz NOT NULL DEFAULT now(),
+    expires_at     timestamptz NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS gateway_tokens_expiry ON did.gateway_tokens (expires_at);
+
+-- ----------------------------------------------------------------------------
+-- 022_vault.sql
+-- ----------------------------------------------------------------------------
+
+-- The vault, in each ORGANISATION database: secrets the control plane holds for
+-- SSH gateways, and a log of every time one was touched.
+--
+-- WHAT GOES IN IT
+--
+--   reconcile_key   the private key of an endpoint's authnull-svc account, which
+--                   a gateway uses to scan accounts and rotate credentials there.
+--                   One per endpoint, released to a gateway only for a job.
+--   grant_password  a target account's rotated password, for one grant.
+--   grant_key       a target account's rotated SSH private key, for one grant.
+--
+-- HOW IT IS ENCRYPTED (internal/pam/vault)
+--
+-- Envelope encryption. Every secret has its own random AES-256-GCM data key; the
+-- data key is stored wrapped by a master key derived from the deployment's
+-- ENCRYPTION_KEY. The org id, secret id, kind and version are authenticated data
+-- on both layers, so a ciphertext copied to another row, another org, or an older
+-- version does not decrypt. A database dump yields ciphertext only.
+--
+-- master_key_version records which master key wrapped the data key, so the master
+-- can be rotated later by re-wrapping data keys without touching ciphertext.
+--
+-- ONE LIVE SECRET PER SLOT
+--
+-- (org, endpoint, kind, account) has at most one row that is not retired: the
+-- partial unique index makes two live reconcile keys for one endpoint, or two
+-- live passwords for one account, unrepresentable. Rotation updates the row in
+-- place and increments version; retiring keeps the row for the audit trail.
+--
+-- THE ACCESS LOG
+--
+-- Every put, rotate, release, refused release and retire, with who asked (a
+-- console user or a gateway), for which job, and why. The question after an
+-- incident is always "who got this secret, and when" -- the log answers it
+-- without the secret ever being in it.
+--
+-- These are SSH-gateway tables. The did.gateway_auth_events and
+-- did.gateway_domain_mappings tables (007) belong to the AD gateway, unrelated.
+--
+-- Numbered 022, following 021_gateway_credentials.sql. Safe to run repeatedly.
+
+CREATE TABLE IF NOT EXISTS did.vault_secrets (
+    id                 uuid        PRIMARY KEY,
+    org_id             integer     NOT NULL,
+    kind               text        NOT NULL
+                       CHECK (kind IN ('reconcile_key', 'grant_password', 'grant_key')),
+    endpoint_id        bigint      NOT NULL,
+    account            text        NOT NULL,
+    version            integer     NOT NULL DEFAULT 1,
+    ciphertext         text        NOT NULL,
+    wrapped_key        text        NOT NULL,
+    master_key_version integer     NOT NULL DEFAULT 1,
+    created_at         timestamptz NOT NULL DEFAULT now(),
+    rotated_at         timestamptz,
+    retired_at         timestamptz
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS vault_secrets_one_live
+    ON did.vault_secrets (org_id, endpoint_id, kind, account) WHERE retired_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS did.vault_access_log (
+    id             bigserial   PRIMARY KEY,
+    org_id         integer     NOT NULL,
+    secret_id      uuid        NOT NULL,
+    secret_version integer,
+    action         text        NOT NULL
+                   CHECK (action IN ('put', 'rotate', 'release', 'refuse', 'retire')),
+    user_id        integer,
+    jump_server_id integer,
+    job_id         text,
+    purpose        text,
+    detail         text,
+    at             timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS vault_access_log_by_secret
+    ON did.vault_access_log (org_id, secret_id, at DESC);
+
+-- ----------------------------------------------------------------------------
+-- 023_gateway_jobs.sql
+-- ----------------------------------------------------------------------------
+
+-- Work the control plane hands to SSH gateways, in each ORGANISATION database.
+--
+-- WHY A NEW TABLE
+--
+-- Gateways sit behind NAT and the control plane cannot call them, so work is
+-- queued here and a gateway collects it: its heartbeat answer says how many jobs
+-- wait, and it claims them over its own authenticated channel. The older
+-- did.jump_server_endpoint_jobs table is a Guacamole-era leftover nothing reads;
+-- it is left alone rather than repurposed.
+--
+-- A JOB'S LIFE
+--
+--   queued   -> claimed  a gateway took it; lease_expires_at bounds how long it
+--                        may hold it. A gateway that goes quiet loses the claim
+--                        when the lease runs out and the job can be claimed again.
+--   claimed  -> done     reported finished, with a result.
+--   claimed  -> queued   reported failed with attempts left.
+--   claimed  -> failed   reported failed on its last attempt.
+--   any open -> expired  not finished by not_after.
+--
+-- The vault releases a job's secret only while the job is claimed, by the
+-- gateway that holds the claim, inside its lease -- which is what "a reconcile
+-- key is only ever in a gateway's hands for one job" rests on. A finished job's
+-- secret can never be released again.
+--
+-- ONE OPEN JOB PER ENDPOINT AND KIND
+--
+-- Pressing Rescan twice queues one scan, not two: the partial unique index makes
+-- a second open job for the same endpoint and kind unrepresentable.
+--
+-- Numbered 023, following 022_vault.sql. Safe to run repeatedly.
+
+CREATE TABLE IF NOT EXISTS did.gateway_jobs (
+    id               uuid        PRIMARY KEY,
+    org_id           integer     NOT NULL,
+    jump_server_id   integer     NOT NULL,
+    endpoint_id      bigint      NOT NULL,
+    kind             text        NOT NULL
+                     CHECK (kind IN ('scan_accounts', 'rotate_credential')),
+    payload          jsonb       NOT NULL DEFAULT '{}'::jsonb,
+    status           text        NOT NULL DEFAULT 'queued'
+                     CHECK (status IN ('queued', 'claimed', 'done', 'failed', 'expired')),
+    attempts         integer     NOT NULL DEFAULT 0,
+    max_attempts     integer     NOT NULL DEFAULT 3,
+    lease_expires_at timestamptz,
+    claimed_at       timestamptz,
+    completed_at     timestamptz,
+    not_after        timestamptz NOT NULL DEFAULT (now() + interval '1 day'),
+    result           jsonb,
+    error            text,
+    created_by       integer,
+    created_at       timestamptz NOT NULL DEFAULT now()
+);
+
+-- did-schema-init replays every migration on each `up`. 024 replaces this index
+-- with a per-account one and allows two open jobs per endpoint and kind, so
+-- recreating it on a replay would fail on that data and stop the stack. Only
+-- create it while 024's index does not exist yet.
+DO $$
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_indexes
+                   WHERE schemaname = 'did' AND indexname = 'gateway_jobs_one_open_per_account') THEN
+        CREATE UNIQUE INDEX IF NOT EXISTS gateway_jobs_one_open
+            ON did.gateway_jobs (org_id, endpoint_id, kind) WHERE status IN ('queued', 'claimed');
+    END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS gateway_jobs_for_gateway
+    ON did.gateway_jobs (org_id, jump_server_id, status, created_at);
+
+-- ----------------------------------------------------------------------------
+-- 024_ssh_grants.sql
+-- ----------------------------------------------------------------------------
+
+-- SSH grants, in each ORGANISATION database: one policy's hold on one account
+-- on one endpoint, and the credential issued for it.
+--
+-- A GRANT'S LIFE
+--
+--   pending  -> active    the gateway installed a fresh key for the account and
+--                         the control plane stored it (vault + sealed grant key).
+--   pending  -> failed    the install job ran out of attempts.
+--   any      -> disabled  replaced by a newer grant for the same account, or its
+--                         policy was edited or deleted. A disabled grant that was
+--                         active gets a revoke job, which removes its key.
+--
+-- ONE ACTIVE GRANT PER ACCOUNT PER ENDPOINT
+--
+-- The partial unique index makes two live grants for one account on one machine
+-- unrepresentable. A new grant for the same account replaces the old one -- the
+-- previous holder loses it, and the new install overwrites the key.
+--
+-- THE GRANT KEY
+--
+-- The account's private key is stored in the vault (kind grant_key) already
+-- encrypted under a per-grant key K. K itself is kept here, sealed under a key
+-- derived from ENCRYPTION_KEY with a label distinct from the vault's. A stolen
+-- vault table alone yields nothing; step 7 releases K for one session only after
+-- MFA approval.
+--
+-- ALSO IN THIS MIGRATION
+--
+--   * revoke_credential joins the job kinds, so removing a key never collides
+--     with the install job of the grant it removes.
+--   * "one open job per endpoint and kind" becomes per endpoint, kind and
+--     ACCOUNT (from the job payload), so granting two accounts on one machine
+--     queues two jobs. Scan jobs carry no account and keep their old behaviour.
+--
+-- Numbered 024, following 023_gateway_jobs.sql. Safe to run repeatedly.
+
+CREATE TABLE IF NOT EXISTS did.ssh_grants (
+    id               uuid        PRIMARY KEY,
+    org_id           integer     NOT NULL,
+    policy_id        uuid,
+    endpoint_id      bigint      NOT NULL,
+    account          text        NOT NULL,
+    jump_server_id   integer     NOT NULL,
+    status           text        NOT NULL DEFAULT 'pending'
+                     CHECK (status IN ('pending', 'active', 'disabled', 'failed')),
+    key_fingerprint  text,
+    grant_key_sealed text,
+    vault_secret_id  uuid,
+    disabled_reason  text,
+    created_by       integer,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    activated_at     timestamptz,
+    disabled_at      timestamptz
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ssh_grants_one_live
+    ON did.ssh_grants (org_id, endpoint_id, account) WHERE status IN ('pending', 'active');
+
+CREATE INDEX IF NOT EXISTS ssh_grants_by_policy ON did.ssh_grants (org_id, policy_id);
+
+ALTER TABLE did.gateway_jobs DROP CONSTRAINT IF EXISTS gateway_jobs_kind_check;
+ALTER TABLE did.gateway_jobs ADD CONSTRAINT gateway_jobs_kind_check
+    CHECK (kind IN ('scan_accounts', 'rotate_credential', 'revoke_credential'));
+
+DROP INDEX IF EXISTS did.gateway_jobs_one_open;
+CREATE UNIQUE INDEX IF NOT EXISTS gateway_jobs_one_open_per_account
+    ON did.gateway_jobs (org_id, endpoint_id, kind, (coalesce(payload->>'account', '')))
+    WHERE status IN ('queued', 'claimed');
+
+-- ----------------------------------------------------------------------------
+-- 025_ssh_decisions.sql
+-- ----------------------------------------------------------------------------
+
+-- SSH decisions, in each ORGANISATION database: one row per decision authn-service
+-- makes for an SSH session, and what it released.
+--
+-- WHY
+--
+-- A grant's key is in the vault (024). Step 7 opens a session with it, released
+-- only after the session was allowed -- and the control plane has to see that
+-- for itself rather than take a gateway's word for it. authn-service writes this
+-- row when it decides; the gateway then asks for the session's key by the row's
+-- id, and the control plane releases it only if:
+--
+--   * the decision allowed the session,
+--   * it was made for the gateway asking (jump_server_id, from the gateway's
+--     verified token -- never from the request body),
+--   * it names the session the gateway says it is opening,
+--   * it is under two minutes old, and
+--   * nothing has been released for it before (credential_released_at).
+--
+-- One decision, one release, one session.
+--
+-- WRITERS
+--
+--   authn-service   inserts, once per decision.
+--   authnull-service sets credential_released_at and released_grant_id.
+--
+-- Numbered 025, following 024_ssh_grants.sql. Safe to run repeatedly.
+
+CREATE TABLE IF NOT EXISTS did.ssh_decisions (
+    id                     uuid        PRIMARY KEY,
+    org_id                 integer     NOT NULL,
+    jump_server_id         integer,
+    session_id             text        NOT NULL,
+    user_id                integer,
+    email                  text,
+    target_host            text        NOT NULL,
+    target_account         text        NOT NULL,
+    outcome                text        NOT NULL CHECK (outcome IN ('allow', 'deny')),
+    reason                 text,
+    mfa_challenge_ref      text,
+    decided_at             timestamptz NOT NULL DEFAULT now(),
+    credential_released_at timestamptz,
+    released_grant_id      uuid
+);
+
+CREATE INDEX IF NOT EXISTS ssh_decisions_by_time ON did.ssh_decisions (org_id, decided_at DESC);
+CREATE INDEX IF NOT EXISTS ssh_decisions_by_session ON did.ssh_decisions (org_id, session_id);
+
+-- ----------------------------------------------------------------------------
+-- 026_gateway_job_backoff.sql
+-- ----------------------------------------------------------------------------
+
+-- Gateway jobs wait between attempts, in each ORGANISATION database.
+--
+-- A failed job went straight back to the queue, so its three attempts were spent
+-- within seconds -- before an administrator had finished running an endpoint's
+-- setup script, say. not_before holds a failed job back (30s, 1m, 2m, 4m, then
+-- every 5m) and lets a job be queued to start a little later.
+--
+-- Additive: code that does not know the column ignores it, and the default
+-- makes every existing and newly inserted row claimable at once.
+--
+-- Numbered 026, following 025_ssh_decisions.sql. Safe to run repeatedly.
+
+ALTER TABLE did.gateway_jobs ADD COLUMN IF NOT EXISTS not_before timestamptz NOT NULL DEFAULT now();
+
+-- ----------------------------------------------------------------------------
+-- 027_endpoint_enrolment.sql
+-- ----------------------------------------------------------------------------
+
+-- Endpoint self-enrolment, in each ORGANISATION database.
+--
+-- An administrator creates an enrolment token for one gateway. A machine that
+-- can reach that gateway runs one command, the same on every machine; the
+-- gateway passes the token, the machine's hostname and the address it OBSERVED
+-- to the control plane, which creates the endpoint (or finds it, for a re-run),
+-- issues its own reconcile key and returns the setup script. The first account
+-- scan is queued with it. Hundreds of machines then enrol through whatever
+-- already runs commands on them -- Ansible, cloud-init, SSM -- with nobody in
+-- the console per machine.
+--
+-- Only the token's SHA-256 is stored. A token is bound to its gateway, expires,
+-- has a use limit and can be revoked. Every use is recorded below.
+--
+-- The gateway's host PUBLIC key is kept on did.jump_server so the console can
+-- print the command with the key pinned: the script arrives over SSH, and a
+-- pinned host key is what stops anyone between the machine and the gateway
+-- from substituting their own.
+--
+-- Numbered 027, following 026_gateway_job_backoff.sql. Safe to run repeatedly.
+
+CREATE TABLE IF NOT EXISTS did.endpoint_enrol_tokens (
+    id             uuid        PRIMARY KEY,
+    org_id         integer     NOT NULL,
+    jump_server_id integer     NOT NULL,
+    name           text,
+    token_hash     text        NOT NULL UNIQUE,
+    expires_at     timestamptz NOT NULL,
+    max_uses       integer     NOT NULL CHECK (max_uses > 0),
+    uses           integer     NOT NULL DEFAULT 0,
+    created_by     integer,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    revoked_at     timestamptz
+);
+
+CREATE INDEX IF NOT EXISTS endpoint_enrol_tokens_by_gateway ON did.endpoint_enrol_tokens (org_id, jump_server_id);
+
+CREATE TABLE IF NOT EXISTS did.endpoint_enrolments (
+    id             bigserial   PRIMARY KEY,
+    org_id         integer     NOT NULL,
+    token_id       uuid        NOT NULL,
+    jump_server_id integer     NOT NULL,
+    machine_id     bigint      NOT NULL,
+    hostname       text,
+    address        text        NOT NULL,
+    created        boolean     NOT NULL,
+    at             timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS endpoint_enrolments_by_token ON did.endpoint_enrolments (org_id, token_id, at DESC);
+
+ALTER TABLE did.jump_server ADD COLUMN IF NOT EXISTS host_public_key text;
+
 
 --
 -- PostgreSQL database dump complete
