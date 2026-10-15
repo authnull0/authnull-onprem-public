@@ -1,0 +1,18 @@
+-- SIEM output secrets, in each ORGANISATION database: the vault holds the
+-- secrets of each tenant's Logs Config output.
+--
+-- WHY
+--
+-- Logs Config stored a Splunk HEC token, Splunk and Elasticsearch passwords and
+-- HTTP custom headers (usually an API key) in plain columns of
+-- did.log_output_*; the get API returned them to the browser and the service
+-- logged them. From here on they live in the vault (022) as kind
+-- 'siem_credential', one secret per tenant at endpoint 0, account
+-- 'siem-tenant-<tenant id>'. The columns are left blank; rows saved before this
+-- are moved into the vault and blanked by authnull-service on start.
+--
+-- Numbered 031, following 030_siem_outbox.sql. Safe to run repeatedly.
+
+ALTER TABLE did.vault_secrets DROP CONSTRAINT IF EXISTS vault_secrets_kind_check;
+ALTER TABLE did.vault_secrets ADD CONSTRAINT vault_secrets_kind_check
+    CHECK (kind IN ('reconcile_key', 'grant_password', 'grant_key', 'storage_credential', 'siem_credential'));
