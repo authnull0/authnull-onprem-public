@@ -9880,6 +9880,1010 @@ CREATE INDEX IF NOT EXISTS endpoint_enrolments_by_token ON did.endpoint_enrolmen
 
 ALTER TABLE did.jump_server ADD COLUMN IF NOT EXISTS host_public_key text;
 
+-- ----------------------------------------------------------------------------
+-- 028_endpoint_decommission.sql
+-- ----------------------------------------------------------------------------
+
+-- Decommissioning an endpoint, in each ORGANISATION database.
+--
+-- A new gateway job kind, "decommission": the gateway logs in as authnull-svc
+-- one last time and has the helper remove everything the setup script installed
+-- (grant keys, sshd drop-ins, sudoers line, the helper, then the account). The
+-- control plane has already ended the endpoint's grants and retired their keys;
+-- when the job reports back it retires the reconcile key and marks the endpoint
+-- Decommissioned (did.epm_machines.status), which every path that issues keys,
+-- scans or lists a gateway's endpoints then skips.
+--
+-- Numbered 028, following 027_endpoint_enrolment.sql. Safe to run repeatedly.
+
+ALTER TABLE did.gateway_jobs DROP CONSTRAINT IF EXISTS gateway_jobs_kind_check;
+ALTER TABLE did.gateway_jobs ADD CONSTRAINT gateway_jobs_kind_check
+    CHECK (kind IN ('scan_accounts', 'rotate_credential', 'revoke_credential', 'decommission'));
+
+-- ----------------------------------------------------------------------------
+-- 029_recording_storage.sql
+-- ----------------------------------------------------------------------------
+
+-- Recording storage, in each ORGANISATION database: where an organisation's SSH
+-- session recordings are kept, and how each recording got there.
+--
+-- WHY
+--
+-- Ingest (018) writes every recording to the control plane's own volume. That
+-- is one disk, sized by whoever installed the service, holding evidence that
+-- grows without bound. Customers keep evidence in their own object store --
+-- S3 (or anything that speaks its API: MinIO, Wasabi, Ceph) or Google Cloud
+-- Storage -- under their own retention, locks and encryption.
+--
+-- HOW A RECORDING MOVES
+--
+--   1. Ingest writes it to the local volume, as before, and marks it
+--      offload_state = 'pending' when the organisation stores elsewhere.
+--   2. The offloader uploads it, checks the stored size, and points the row at
+--      the object (storage_backend, storage_bucket, storage_object). Only then
+--      is the local copy deleted; local_delete_pending covers a crash between
+--      the two, so a copy is never orphaned on the volume.
+--   3. A failed upload is retried, 30s doubling to 5 minutes, without limit: a
+--      bucket that is down for a day loses nothing, it only delays.
+--   4. A local copy that no longer matches its ingest digest is never uploaded
+--      ('held'): copying altered evidence into the archive would launder it.
+--
+-- storage_key keeps its meaning -- <org>/<jump server>/<recording>.cast, the
+-- recording's identity and the key ingest's upsert matches on -- whichever
+-- backend holds the bytes.
+--
+-- CREDENTIALS
+--
+-- Never in this table. Either the service's own cloud identity is used
+-- ('ambient': an instance role, workload identity, environment), or the
+-- credential is sealed in the vault (022) as kind 'storage_credential', at
+-- endpoint 0 -- it belongs to the organisation, not to an endpoint.
+--
+-- Numbered 029, following 028_endpoint_decommission.sql. Safe to run repeatedly.
+
+CREATE TABLE IF NOT EXISTS did.recording_storage (
+    org_id               integer     PRIMARY KEY,
+    provider             text        NOT NULL DEFAULT 'local'
+                         CHECK (provider IN ('local', 's3', 'gcs')),
+    bucket               text,
+    region               text,
+    endpoint             text,
+    prefix               text        NOT NULL DEFAULT '',
+    path_style           boolean     NOT NULL DEFAULT false,
+    sse                  text        NOT NULL DEFAULT ''
+                         CHECK (sse IN ('', 'AES256', 'aws:kms')),
+    kms_key_id           text,
+    credential_mode      text        NOT NULL DEFAULT 'ambient'
+                         CHECK (credential_mode IN ('ambient', 'static')),
+    credential_secret_id uuid,
+    revision             integer     NOT NULL DEFAULT 1,
+    updated_by           integer,
+    updated_at           timestamptz NOT NULL DEFAULT now(),
+    last_test_at         timestamptz,
+    last_test_ok         boolean,
+    last_test_error      text
+);
+
+ALTER TABLE did.jump_server_recordings
+    ADD COLUMN IF NOT EXISTS storage_bucket       text,
+    ADD COLUMN IF NOT EXISTS storage_object       text,
+    ADD COLUMN IF NOT EXISTS offload_state        text
+                             CHECK (offload_state IN ('pending', 'done', 'held')),
+    ADD COLUMN IF NOT EXISTS offload_attempts     integer NOT NULL DEFAULT 0,
+    ADD COLUMN IF NOT EXISTS offload_next_at      timestamptz,
+    ADD COLUMN IF NOT EXISTS offload_error        text,
+    ADD COLUMN IF NOT EXISTS offloaded_at         timestamptz,
+    ADD COLUMN IF NOT EXISTS local_delete_pending boolean NOT NULL DEFAULT false;
+
+CREATE INDEX IF NOT EXISTS jump_server_recordings_offload_due
+    ON did.jump_server_recordings (offload_next_at)
+    WHERE offload_state = 'pending';
+
+CREATE INDEX IF NOT EXISTS jump_server_recordings_local_delete
+    ON did.jump_server_recordings (id)
+    WHERE local_delete_pending;
+
+-- The vault holds the organisation's storage credential.
+ALTER TABLE did.vault_secrets DROP CONSTRAINT IF EXISTS vault_secrets_kind_check;
+ALTER TABLE did.vault_secrets ADD CONSTRAINT vault_secrets_kind_check
+    CHECK (kind IN ('reconcile_key', 'grant_password', 'grant_key', 'storage_credential'));
+
+-- ----------------------------------------------------------------------------
+-- 030_siem_outbox.sql
+-- ----------------------------------------------------------------------------
+
+-- SIEM outbox, in each ORGANISATION database: security events on their way to
+-- the organisation's SIEM.
+--
+-- WHY
+--
+-- SSH gateway and control-plane events (sessions, refusals, key releases,
+-- endpoint lifecycle) go to the SIEM each tenant configures in Logs Config,
+-- through the on-prem Fluent Bit. Fluent Bit buffers once it has an event; this
+-- table covers the step before: an event is written here in the same breath as
+-- the thing it reports, and the forwarder moves it to Fluent Bit, retrying
+-- while Fluent Bit restarts or is unreachable.
+--
+-- event_id is unique: a gateway that re-sends a batch it is unsure was received
+-- adds nothing twice, and the SIEM can deduplicate on the same id.
+--
+-- Rows are deleted a day after they are sent; one never sent goes after seven
+-- days, so an organisation with no SIEM -- or one down for a week -- does not
+-- grow this table without bound.
+--
+-- Numbered 030, following 029_recording_storage.sql. Safe to run repeatedly.
+
+CREATE TABLE IF NOT EXISTS did.siem_outbox (
+    id         bigserial   PRIMARY KEY,
+    event_id   uuid        NOT NULL UNIQUE,
+    log_type   text        NOT NULL DEFAULT 'ssh',
+    body       jsonb       NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    sent_at    timestamptz
+);
+
+CREATE INDEX IF NOT EXISTS siem_outbox_unsent
+    ON did.siem_outbox (id)
+    WHERE sent_at IS NULL;
+
+-- ----------------------------------------------------------------------------
+-- 031_siem_output_secrets.sql
+-- ----------------------------------------------------------------------------
+
+-- SIEM output secrets, in each ORGANISATION database: the vault holds the
+-- secrets of each tenant's Logs Config output.
+--
+-- WHY
+--
+-- Logs Config stored a Splunk HEC token, Splunk and Elasticsearch passwords and
+-- HTTP custom headers (usually an API key) in plain columns of
+-- did.log_output_*; the get API returned them to the browser and the service
+-- logged them. From here on they live in the vault (022) as kind
+-- 'siem_credential', one secret per tenant at endpoint 0, account
+-- 'siem-tenant-<tenant id>'. The columns are left blank; rows saved before this
+-- are moved into the vault and blanked by authnull-service on start.
+--
+-- Numbered 031, following 030_siem_outbox.sql. Safe to run repeatedly.
+
+ALTER TABLE did.vault_secrets DROP CONSTRAINT IF EXISTS vault_secrets_kind_check;
+ALTER TABLE did.vault_secrets ADD CONSTRAINT vault_secrets_kind_check
+    CHECK (kind IN ('reconcile_key', 'grant_password', 'grant_key', 'storage_credential', 'siem_credential'));
+
+-- ----------------------------------------------------------------------------
+-- 032_ssh_access_events.sql
+-- ----------------------------------------------------------------------------
+
+-- SSH access events, in each ORGANISATION database: what each gateway reported
+-- about each connection -- decisions, refusals, session start and end, stored
+-- recordings -- kept for the console's SSH access log.
+--
+-- WHY
+--
+-- The access log shows one row per SSH access attempt, assembled from the
+-- decision (did.ssh_decisions, written by authn-service), the recording
+-- (did.jump_server_recordings) and these events. A connection refused at the
+-- gateway -- no certificate, a target that is not one of its endpoints --
+-- never reaches the decision service, so these events are its only record.
+-- The SIEM outbox (030) holds the same events only until they are delivered;
+-- this table is the console's own copy, kept whether or not a SIEM is
+-- configured.
+--
+-- event_id is the gateway's: a batch sent twice is stored once.
+-- Rows older than SSH_ACCESS_LOG_DAYS (default 180) are deleted hourly.
+--
+-- Numbered 032, following 031_siem_output_secrets.sql. Safe to run repeatedly.
+
+CREATE TABLE IF NOT EXISTS did.ssh_access_events (
+    event_id        uuid        PRIMARY KEY,
+    org_id          integer     NOT NULL,
+    jump_server_id  integer     NOT NULL,
+    event_type      text        NOT NULL,
+    outcome         text        NOT NULL,
+    reason          text,
+    session_id      text,
+    decision_id     text,
+    principal       text,
+    key_fingerprint text,
+    src_ip          text,
+    target_host     text,
+    target_account  text,
+    details         jsonb,
+    occurred_at     timestamptz NOT NULL,
+    received_at     timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS ssh_access_events_by_time
+    ON did.ssh_access_events (org_id, occurred_at DESC);
+CREATE INDEX IF NOT EXISTS ssh_access_events_by_session
+    ON did.ssh_access_events (session_id)
+    WHERE session_id IS NOT NULL;
+
+-- ----------------------------------------------------------------------------
+-- 033_splunk_tls_skip_verify.sql
+-- ----------------------------------------------------------------------------
+
+-- Splunk outputs, in each ORGANISATION database: an explicit opt-out of TLS
+-- certificate verification for a Splunk HEC.
+--
+-- WHY
+--
+-- The SIEM renderer (internal/pam/siem) always verified a Splunk HEC's
+-- certificate, and an on-prem Splunk usually presents a self-signed one: every
+-- event was refused at the TLS handshake. tls_skip_verify lets an
+-- administrator say so for one output, deliberately. False -- verify -- unless
+-- set, so no existing or future output loses verification by accident.
+--
+-- Numbered 033, following 032_ssh_access_events.sql. Safe to run repeatedly.
+
+ALTER TABLE did.log_output_splunk
+    ADD COLUMN IF NOT EXISTS tls_skip_verify boolean NOT NULL DEFAULT false;
+
+-- ----------------------------------------------------------------------------
+-- 034_sudo_elevation.sql
+-- ----------------------------------------------------------------------------
+
+-- Sudo elevation, in each ORGANISATION database.
+--
+-- WHAT
+--
+-- An administrator grants one operator sudo on one account of one endpoint:
+-- "aditya@ may elevate to sshtest on web-vm-01, for these commands (or full
+-- sudo), until Friday". That is a did.sudo_grants row. Nothing is installed on
+-- the endpoint when it is created.
+--
+-- When that operator opens an SSH session to that account through the gateway
+-- and approves its push, the control plane -- releasing the session's key --
+-- records a did.sudo_elevations row and queues a grant_sudo job. The gateway
+-- runs it at once: the endpoint helper writes /etc/sudoers.d/authnull-sudo-<account>
+-- (checked with visudo) and schedules its own removal at the elevation's expiry.
+-- When the session ends, or the elevation expires, or the grant is revoked, a
+-- revoke_sudo job removes the file and ends any root process the account's
+-- logins still run.
+--
+-- RULES
+--
+--   * Elevation needs a second factor: only a decision made with an MFA
+--     challenge (did.ssh_decisions.mfa_challenge_ref) elevates.
+--   * One live elevation per account per endpoint. While an account is
+--     elevated, a second session to it is refused: sudo belongs to the Unix
+--     account, so anyone else in it would hold the same rights.
+--   * An elevation never outlives its grant, nor max_minutes.
+--
+-- Numbered 034, following 033_splunk_tls_skip_verify.sql. Safe to run repeatedly.
+
+CREATE TABLE IF NOT EXISTS did.sudo_grants (
+    id               uuid        PRIMARY KEY,
+    org_id           integer     NOT NULL,
+    endpoint_id      bigint      NOT NULL,
+    account          text        NOT NULL,
+    operator_user_id integer,
+    operator_email   text        NOT NULL,
+    full_sudo        boolean     NOT NULL DEFAULT false,
+    commands         jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    max_minutes      integer     NOT NULL DEFAULT 60 CHECK (max_minutes BETWEEN 5 AND 720),
+    valid_from       timestamptz NOT NULL DEFAULT now(),
+    valid_until      timestamptz,
+    reason           text,
+    status           text        NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'revoked')),
+    created_by       integer,
+    created_at       timestamptz NOT NULL DEFAULT now(),
+    revoked_at       timestamptz,
+    revoked_by       integer,
+    revoked_reason   text,
+    CHECK (full_sudo OR jsonb_array_length(commands) > 0)
+);
+
+CREATE INDEX IF NOT EXISTS sudo_grants_by_slot
+    ON did.sudo_grants (org_id, endpoint_id, account) WHERE status = 'active';
+
+CREATE TABLE IF NOT EXISTS did.sudo_elevations (
+    id             uuid        PRIMARY KEY,
+    org_id         integer     NOT NULL,
+    grant_id       uuid        NOT NULL REFERENCES did.sudo_grants (id),
+    endpoint_id    bigint      NOT NULL,
+    jump_server_id integer     NOT NULL,
+    account        text        NOT NULL,
+    session_id     text        NOT NULL,
+    decision_id    text        NOT NULL,
+    operator_email text        NOT NULL,
+    full_sudo      boolean     NOT NULL,
+    commands       jsonb       NOT NULL,
+    status         text        NOT NULL DEFAULT 'pending'
+                               CHECK (status IN ('pending', 'active', 'ended', 'failed')),
+    expires_at     timestamptz NOT NULL,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    installed_at   timestamptz,
+    ended_at       timestamptz,
+    end_reason     text,
+    removed_at     timestamptz
+);
+
+-- One live elevation per account per endpoint.
+CREATE UNIQUE INDEX IF NOT EXISTS sudo_elevations_one_live
+    ON did.sudo_elevations (org_id, endpoint_id, account) WHERE status IN ('pending', 'active');
+CREATE INDEX IF NOT EXISTS sudo_elevations_by_session
+    ON did.sudo_elevations (org_id, session_id);
+CREATE INDEX IF NOT EXISTS sudo_elevations_by_time
+    ON did.sudo_elevations (org_id, created_at DESC);
+
+ALTER TABLE did.gateway_jobs DROP CONSTRAINT IF EXISTS gateway_jobs_kind_check;
+ALTER TABLE did.gateway_jobs ADD CONSTRAINT gateway_jobs_kind_check
+    CHECK (kind IN ('scan_accounts', 'rotate_credential', 'revoke_credential', 'decommission',
+                    'grant_sudo', 'revoke_sudo'));
+
+-- The endpoint helper's version, read by each account scan. Sudo elevation
+-- needs version 2; an endpoint set up before it shows "re-run setup".
+ALTER TABLE did.epm_machines ADD COLUMN IF NOT EXISTS helper_version integer;
+
+-- ----------------------------------------------------------------------------
+-- 035_password_rotation.sql
+-- ----------------------------------------------------------------------------
+
+-- Password rotation for local accounts, in each ORGANISATION database.
+--
+-- WHY
+--
+-- Logins through the gateway never use passwords, but a local password is a
+-- door that does not go through it: password SSH straight to the machine, the
+-- VM console, su. Rotation makes every such password random, known to nobody,
+-- and held in the vault for break-glass.
+--
+-- WHAT
+--
+--   * did.password_policies: rotate these accounts (or every scanned one) on
+--     these endpoints every N days, at this length and complexity; root only
+--     when include_root is set. An account with no usable password (locked,
+--     key-only) is left locked -- setting one would open a door -- except root
+--     under include_root, which is the break-glass password.
+--   * did.password_accounts: one row per (endpoint, account) a policy manages:
+--     when it was last rotated, when it is due, and why it failed or was
+--     skipped. Due rotations are queued from the gateway's heartbeat.
+--   * A rotation is two-step so a password is never lost: the gateway stores
+--     the new password as account_password_staged, sets it on the machine, and
+--     only then is it promoted to account_password. A rotation that fails
+--     before the machine changed leaves the current password as it was.
+--   * did.password_reveals: an administrator's break-glass reveal, behind an
+--     MFA push, shown once. The account is rotated again
+--     rerotate_after_reveal_minutes later, so a revealed password does not
+--     stay valid.
+--
+-- Numbered 035, following 034_sudo_elevation.sql. Safe to run repeatedly.
+
+CREATE TABLE IF NOT EXISTS did.password_policies (
+    id                            uuid        PRIMARY KEY,
+    org_id                        integer     NOT NULL,
+    name                          text        NOT NULL,
+    status                        text        NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'paused')),
+    endpoint_ids                  jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    accounts                      jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    include_root                  boolean     NOT NULL DEFAULT false,
+    interval_days                 integer     NOT NULL DEFAULT 30 CHECK (interval_days BETWEEN 1 AND 365),
+    length                        integer     NOT NULL DEFAULT 24 CHECK (length BETWEEN 12 AND 128),
+    upper                         boolean     NOT NULL DEFAULT true,
+    lower                         boolean     NOT NULL DEFAULT true,
+    digits                        boolean     NOT NULL DEFAULT true,
+    special                       boolean     NOT NULL DEFAULT true,
+    rerotate_after_reveal_minutes integer     NOT NULL DEFAULT 60 CHECK (rerotate_after_reveal_minutes BETWEEN 5 AND 1440),
+    created_by                    integer,
+    created_at                    timestamptz NOT NULL DEFAULT now(),
+    updated_by                    integer,
+    updated_at                    timestamptz NOT NULL DEFAULT now(),
+    CHECK (upper OR lower OR digits OR special)
+);
+
+CREATE TABLE IF NOT EXISTS did.password_accounts (
+    org_id      integer     NOT NULL,
+    endpoint_id bigint      NOT NULL,
+    account     text        NOT NULL,
+    policy_id   uuid,
+    status      text        NOT NULL DEFAULT 'pending'
+                            CHECK (status IN ('pending', 'managed', 'no_password', 'failed')),
+    detail      text,
+    rotated_at  timestamptz,
+    next_due_at timestamptz NOT NULL DEFAULT now(),
+    rerotate_at timestamptz,
+    revealed_at timestamptz,
+    revealed_by integer,
+    last_job_id text,
+    failures    integer     NOT NULL DEFAULT 0,
+    updated_at  timestamptz NOT NULL DEFAULT now(),
+    PRIMARY KEY (org_id, endpoint_id, account)
+);
+
+CREATE TABLE IF NOT EXISTS did.password_reveals (
+    id           uuid        PRIMARY KEY,
+    org_id       integer     NOT NULL,
+    endpoint_id  bigint      NOT NULL,
+    account      text        NOT NULL,
+    user_id      integer     NOT NULL,
+    email        text        NOT NULL,
+    challenge_id integer     NOT NULL,
+    status       text        NOT NULL DEFAULT 'pending'
+                             CHECK (status IN ('pending', 'approved', 'denied', 'expired', 'shown')),
+    created_at   timestamptz NOT NULL DEFAULT now(),
+    resolved_at  timestamptz
+);
+CREATE INDEX IF NOT EXISTS password_reveals_by_time ON did.password_reveals (org_id, created_at DESC);
+
+ALTER TABLE did.vault_secrets DROP CONSTRAINT IF EXISTS vault_secrets_kind_check;
+ALTER TABLE did.vault_secrets ADD CONSTRAINT vault_secrets_kind_check
+    CHECK (kind IN ('reconcile_key', 'grant_password', 'grant_key', 'storage_credential', 'siem_credential',
+                    'account_password', 'account_password_staged'));
+
+ALTER TABLE did.gateway_jobs DROP CONSTRAINT IF EXISTS gateway_jobs_kind_check;
+ALTER TABLE did.gateway_jobs ADD CONSTRAINT gateway_jobs_kind_check
+    CHECK (kind IN ('scan_accounts', 'rotate_credential', 'revoke_credential', 'decommission',
+                    'grant_sudo', 'revoke_sudo', 'rotate_password'));
+
+-- ----------------------------------------------------------------------------
+-- 036_password_login.sql
+-- ----------------------------------------------------------------------------
+
+-- Logging in with a rotated password through the gateway, in each
+-- ORGANISATION database.
+--
+-- A password policy's login_method says what its passwords are for:
+--
+--   'password' -- the gateway opens sessions to these accounts with the vaulted
+--                 password, released once per approved session exactly as a
+--                 grant key is (sshgrants.ReleaseForDecision). The operator
+--                 never sees it, and Endpoint Policies install no key for
+--                 these accounts: one credential per account.
+--   'none'     -- rotation and break-glass reveal only; sessions use keys.
+--
+-- Every managed endpoint also gets an sshd rule from its helper (version 4):
+-- password SSH only from its gateway's address, root never by password. Its
+-- state, as last applied by a scan, is epm_machines.password_ssh.
+--
+-- Numbered 036, following 035_password_rotation.sql. Safe to run repeatedly.
+
+ALTER TABLE did.password_policies ADD COLUMN IF NOT EXISTS login_method text NOT NULL DEFAULT 'password';
+ALTER TABLE did.password_policies DROP CONSTRAINT IF EXISTS password_policies_login_method_check;
+ALTER TABLE did.password_policies ADD CONSTRAINT password_policies_login_method_check
+    CHECK (login_method IN ('password', 'none'));
+
+-- 'gateway-only' (applied), or the reason it could not be.
+ALTER TABLE did.epm_machines ADD COLUMN IF NOT EXISTS password_ssh text;
+
+ALTER TABLE did.ssh_decisions ADD COLUMN IF NOT EXISTS released_credential text;
+
+-- ----------------------------------------------------------------------------
+-- 037_account_credential.sql
+-- ----------------------------------------------------------------------------
+
+-- The Credential column: per account, per endpoint, which credential the
+-- gateway opens sessions with, in each ORGANISATION database.
+--
+-- did.password_accounts.credential overrides the rotation profile's
+-- login_method for one account on one endpoint:
+--   'key'      -- a grant key, whatever the profile says;
+--   'password' -- the rotated password (needs a current one);
+--   NULL       -- the profile decides ('password' -> password, 'none' -> key).
+--
+-- Numbered 037, following 036_password_login.sql. Safe to run repeatedly.
+
+ALTER TABLE did.password_accounts ADD COLUMN IF NOT EXISTS credential text;
+ALTER TABLE did.password_accounts DROP CONSTRAINT IF EXISTS password_accounts_credential_check;
+ALTER TABLE did.password_accounts ADD CONSTRAINT password_accounts_credential_check
+    CHECK (credential IS NULL OR credential IN ('key', 'password'));
+
+-- ----------------------------------------------------------------------------
+-- 038_password_ssh_exceptions.sql
+-- ----------------------------------------------------------------------------
+
+-- Password SSH exceptions, in each ORGANISATION database.
+--
+-- Every managed endpoint accepts password SSH only from its gateway (036).
+-- epm_machines.password_ssh_allow names accounts that may still use password
+-- SSH directly -- a shared account people already log in to that way, say
+-- -- on that one endpoint. Never root (no password SSH for root at all) and
+-- never authnull-svc. The gateway passes the list to the helper on each scan.
+--
+-- Numbered 038, following 037_account_credential.sql. Safe to run repeatedly.
+
+ALTER TABLE did.epm_machines ADD COLUMN IF NOT EXISTS password_ssh_allow jsonb NOT NULL DEFAULT '[]'::jsonb;
+
+-- ----------------------------------------------------------------------------
+-- 039_sso_providers.sql
+-- ----------------------------------------------------------------------------
+
+-- Single sign-on to the console with OpenID Connect or GitHub, in each
+-- ORGANISATION database.
+--
+-- A provider belongs to one tenant: its sign-in button is shown on that
+-- tenant's login page. Signing in maps the identity provider's VERIFIED email
+-- to an existing, active user of that tenant -- never creates one -- and issues
+-- the same session a password sign-in does.
+--
+--   kind 'oidc'   -- any OpenID Connect provider (Google, Okta, Entra ID,
+--                    Keycloak, ...): issuer, client id and secret. The ID token
+--                    is verified against the issuer's published keys.
+--   kind 'github' -- GitHub OAuth: the account's primary, verified email;
+--                    optionally membership of github_org.
+--
+-- The client secret is in the vault (kind sso_client_secret, organisation
+-- level, account sso-<provider id>), never in this table.
+--
+-- Numbered 039, following 038_password_ssh_exceptions.sql. Safe to run repeatedly.
+
+CREATE TABLE IF NOT EXISTS did.sso_providers (
+    id                     uuid        PRIMARY KEY,
+    org_id                 integer     NOT NULL,
+    tenant_id              integer     NOT NULL,
+    kind                   text        NOT NULL CHECK (kind IN ('oidc', 'github')),
+    name                   text        NOT NULL,
+    issuer                 text,
+    client_id              text        NOT NULL,
+    scopes                 text        NOT NULL DEFAULT '',
+    email_claim            text        NOT NULL DEFAULT 'email',
+    require_email_verified boolean     NOT NULL DEFAULT true,
+    allowed_domains        jsonb       NOT NULL DEFAULT '[]'::jsonb,
+    github_org             text,
+    enabled                boolean     NOT NULL DEFAULT true,
+    created_by             integer,
+    created_at             timestamptz NOT NULL DEFAULT now(),
+    updated_at             timestamptz NOT NULL DEFAULT now(),
+    CHECK (kind <> 'oidc' OR coalesce(issuer, '') <> '')
+);
+CREATE INDEX IF NOT EXISTS sso_providers_by_tenant ON did.sso_providers (org_id, tenant_id) WHERE enabled;
+
+ALTER TABLE did.vault_secrets DROP CONSTRAINT IF EXISTS vault_secrets_kind_check;
+ALTER TABLE did.vault_secrets ADD CONSTRAINT vault_secrets_kind_check
+    CHECK (kind IN ('reconcile_key', 'grant_password', 'grant_key', 'storage_credential', 'siem_credential',
+                    'account_password', 'account_password_staged', 'sso_client_secret'));
+
+-- ----------------------------------------------------------------------------
+-- 040_temp_users.sql
+-- ----------------------------------------------------------------------------
+
+-- Temporary users: a local account created on an endpoint for one approved SSH
+-- session and deleted when it ends.
+--
+-- An Endpoint Policy that lists the reserved account "temp" lets its operators
+-- connect as `temp@host@gateway`. When such a session is approved, the control
+-- plane names the operator's account on that endpoint (an-<name>-<hash>), makes
+-- a key for the session, records a did.temp_users row and queues a
+-- temp_user_add job. The gateway runs it at once: the endpoint helper creates
+-- the account (no password, locked), installs the session's public key, and
+-- schedules the account's removal at the row's expiry, so it cannot outlive it
+-- if the gateway goes away. The gateway then logs in as that account with that
+-- key. When the session ends -- or expires -- a temp_user_del job removes the
+-- session's key, and the account itself once no other session uses it.
+--
+-- Numbered 040, following 039_sso_providers.sql. Safe to run repeatedly.
+
+CREATE TABLE IF NOT EXISTS did.temp_users (
+    id              uuid        PRIMARY KEY,
+    org_id          integer     NOT NULL,
+    endpoint_id     bigint      NOT NULL,
+    jump_server_id  integer     NOT NULL,
+    account         text        NOT NULL,
+    operator_email  text        NOT NULL,
+    operator_id     integer,
+    session_id      text        NOT NULL,
+    decision_id     text,
+    key_fingerprint text        NOT NULL,
+    status          text        NOT NULL DEFAULT 'pending'
+                    CHECK (status IN ('pending', 'active', 'ended', 'failed')),
+    expires_at      timestamptz NOT NULL,
+    created_at      timestamptz NOT NULL DEFAULT now(),
+    active_at       timestamptz,
+    ended_at        timestamptz,
+    end_reason      text,
+    removed_at      timestamptz
+);
+CREATE INDEX IF NOT EXISTS temp_users_by_endpoint ON did.temp_users (org_id, endpoint_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS temp_users_by_session ON did.temp_users (org_id, session_id);
+CREATE INDEX IF NOT EXISTS temp_users_live ON did.temp_users (org_id, jump_server_id, expires_at)
+    WHERE status IN ('pending', 'active');
+
+ALTER TABLE did.gateway_jobs DROP CONSTRAINT IF EXISTS gateway_jobs_kind_check;
+ALTER TABLE did.gateway_jobs ADD CONSTRAINT gateway_jobs_kind_check
+    CHECK (kind IN ('scan_accounts', 'rotate_credential', 'revoke_credential', 'decommission',
+                    'grant_sudo', 'revoke_sudo', 'rotate_password', 'temp_user_add', 'temp_user_del'));
+
+-- ----------------------------------------------------------------------------
+-- 041_managed_accounts.sql
+-- ----------------------------------------------------------------------------
+
+-- Managed temporary accounts: a named local account an administrator creates
+-- on an endpoint for a fixed time -- a contractor's or a vendor's -- with a
+-- vaulted, rotated password, deleted when the time is up.
+--
+-- Creating one records a did.managed_accounts row and queues a
+-- managed_account_add job. The gateway has the endpoint helper create the
+-- account (marked as Authnull's by its GECOS field, with a throwaway random
+-- password nobody sees) and schedule its own removal at the expiry. When the
+-- gateway reports it created, the account joins the rotation profile chosen
+-- for it (did.password_accounts, credential 'password') and its first
+-- rotation is queued at once: from then on the password is the vault's, the
+-- gateway logs in with it, and a reveal works as for any rotated account.
+--
+-- At the expiry -- or when an administrator removes it -- a
+-- managed_account_del job deletes the account from the endpoint; its vaulted
+-- password is retired and it leaves its profile.
+--
+-- Numbered 041, following 040_temp_users.sql. Safe to run repeatedly.
+
+CREATE TABLE IF NOT EXISTS did.managed_accounts (
+    id                uuid        PRIMARY KEY,
+    org_id            integer     NOT NULL,
+    endpoint_id       bigint      NOT NULL,
+    jump_server_id    integer     NOT NULL,
+    account           text        NOT NULL,
+    password_policy_id uuid       NOT NULL,
+    note              text,
+    status            text        NOT NULL DEFAULT 'pending'
+                      CHECK (status IN ('pending', 'active', 'removing', 'removed', 'failed')),
+    expires_at        timestamptz NOT NULL,
+    created_by        integer,
+    created_at        timestamptz NOT NULL DEFAULT now(),
+    active_at         timestamptz,
+    ended_at          timestamptz,
+    end_reason        text,
+    ended_by          integer,
+    removed_at        timestamptz
+);
+CREATE INDEX IF NOT EXISTS managed_accounts_by_endpoint ON did.managed_accounts (org_id, endpoint_id, created_at DESC);
+-- One live managed account of a name per endpoint.
+CREATE UNIQUE INDEX IF NOT EXISTS managed_accounts_one_live
+    ON did.managed_accounts (org_id, endpoint_id, account) WHERE status IN ('pending', 'active', 'removing');
+CREATE INDEX IF NOT EXISTS managed_accounts_due ON did.managed_accounts (org_id, jump_server_id, expires_at)
+    WHERE status IN ('pending', 'active');
+
+ALTER TABLE did.gateway_jobs DROP CONSTRAINT IF EXISTS gateway_jobs_kind_check;
+ALTER TABLE did.gateway_jobs ADD CONSTRAINT gateway_jobs_kind_check
+    CHECK (kind IN ('scan_accounts', 'rotate_credential', 'revoke_credential', 'decommission',
+                    'grant_sudo', 'revoke_sudo', 'rotate_password', 'temp_user_add', 'temp_user_del',
+                    'managed_account_add', 'managed_account_del'));
+
+-- ----------------------------------------------------------------------------
+-- 042_admin_account.sql
+-- ----------------------------------------------------------------------------
+
+-- Endpoints onboarded with an existing admin account instead of the setup
+-- script (CyberArk calls this a reconcile account).
+--
+-- An administrator gives an account that already exists on the machine and
+-- can use sudo -- its username and password, or private key. The credential is
+-- kept in the vault (kind admin_credential, never shown again) and the
+-- endpoint's access_mode becomes 'admin'. A bootstrap job then has the gateway
+-- log in with it and install the Authnull helper and the grant-key sshd
+-- setting through sudo -- the setup script without its authnull-svc account.
+-- From then on every job on that endpoint logs in as the admin account and
+-- runs the helper through sudo; endpoints set up with the script keep
+-- access_mode 'svc' and work as before.
+--
+-- Numbered 042, following 041_managed_accounts.sql. Safe to run repeatedly.
+
+ALTER TABLE did.epm_machines ADD COLUMN IF NOT EXISTS access_mode text NOT NULL DEFAULT 'svc';
+ALTER TABLE did.epm_machines DROP CONSTRAINT IF EXISTS epm_machines_access_mode_check;
+ALTER TABLE did.epm_machines ADD CONSTRAINT epm_machines_access_mode_check CHECK (access_mode IN ('svc', 'admin'));
+-- The admin account's username, for display; the credential is in the vault.
+ALTER TABLE did.epm_machines ADD COLUMN IF NOT EXISTS admin_account text;
+
+-- This file owns the full kind lists of vault_secrets and gateway_jobs. Every migration is
+-- replayed in order on each boot, so an earlier file that re-added its own shorter list would
+-- reject rows of a later kind and, under set -e, stop every migration after it (024 to 041 used
+-- to do exactly that). To add a kind, extend the list here, or move these statements to the new
+-- file and delete them here: never leave two files setting the same constraint.
+ALTER TABLE did.vault_secrets DROP CONSTRAINT IF EXISTS vault_secrets_kind_check;
+ALTER TABLE did.vault_secrets ADD CONSTRAINT vault_secrets_kind_check
+    CHECK (kind IN ('reconcile_key', 'grant_password', 'grant_key', 'storage_credential', 'siem_credential',
+                    'account_password', 'account_password_staged', 'sso_client_secret', 'admin_credential'));
+
+ALTER TABLE did.gateway_jobs DROP CONSTRAINT IF EXISTS gateway_jobs_kind_check;
+ALTER TABLE did.gateway_jobs ADD CONSTRAINT gateway_jobs_kind_check
+    CHECK (kind IN ('scan_accounts', 'rotate_credential', 'revoke_credential', 'decommission',
+                    'grant_sudo', 'revoke_sudo', 'rotate_password', 'temp_user_add', 'temp_user_del',
+                    'managed_account_add', 'managed_account_del', 'bootstrap'));
+-- ----------------------------------------------------------------------------
+-- 043_local_users.sql
+-- ----------------------------------------------------------------------------
+
+-- Local users: one place for an endpoint's accounts, without rotation
+-- profiles.
+--
+-- * Per-account rotation. "Rotate this user's password every N days" is a
+--   rotation profile of its own, kept out of the profile list: scope_endpoint_id
+--   and scope_account name the one account it covers. Shared profiles leave
+--   both NULL. An account's own profile takes precedence over any shared one
+--   that names it.
+--
+-- * Add user. A managed account now logs in either with the key Authnull
+--   already holds for it (credential 'key': no vaulted password, no rotation)
+--   or with a vaulted, rotated password (credential 'password', in its own
+--   per-account profile). And it may be permanent: expires_at NULL, removed
+--   only when an administrator removes it (endpoint helper version 8).
+--
+-- * The endpoint's operating system and FQDN, read by each account scan
+--   (os_name; fqdn already exists), and which local accounts have a password
+--   set (password_state: {"alice": "P", "bob": "L", ...}, from passwd -S).
+--
+-- Numbered 043, following 042_admin_account.sql. Safe to run repeatedly.
+
+ALTER TABLE did.password_policies ADD COLUMN IF NOT EXISTS scope_endpoint_id bigint;
+ALTER TABLE did.password_policies ADD COLUMN IF NOT EXISTS scope_account text;
+CREATE UNIQUE INDEX IF NOT EXISTS password_policies_one_per_account
+    ON did.password_policies (org_id, scope_endpoint_id, scope_account) WHERE scope_endpoint_id IS NOT NULL;
+
+ALTER TABLE did.managed_accounts ADD COLUMN IF NOT EXISTS credential text NOT NULL DEFAULT 'password';
+ALTER TABLE did.managed_accounts DROP CONSTRAINT IF EXISTS managed_accounts_credential_check;
+ALTER TABLE did.managed_accounts ADD CONSTRAINT managed_accounts_credential_check CHECK (credential IN ('key', 'password'));
+ALTER TABLE did.managed_accounts ALTER COLUMN password_policy_id DROP NOT NULL;
+ALTER TABLE did.managed_accounts ALTER COLUMN expires_at DROP NOT NULL;
+
+ALTER TABLE did.epm_machines ADD COLUMN IF NOT EXISTS os_name text;
+ALTER TABLE did.epm_machines ADD COLUMN IF NOT EXISTS password_state jsonb;
+-- How often a password-credential managed account rotates once created; its
+-- own profile is made when the endpoint reports the account exists.
+ALTER TABLE did.managed_accounts ADD COLUMN IF NOT EXISTS rotation_interval_days integer;
+-- ----------------------------------------------------------------------------
+-- 044_policy_sudo.sql
+-- ----------------------------------------------------------------------------
+
+-- Sudo from SSH policies. An SSH policy may carry ssh.sudo -- full sudo, or
+-- named commands, for at most maxMinutes -- and every session it lets in,
+-- approved with a second factor, is elevated with it, exactly as a sudo grant
+-- elevates one (see 034_sudo_elevation.sql). The standalone grant stays for
+-- what was set up with it.
+--
+-- An elevation now comes from a grant (grant_id) or a policy (policy_id, the
+-- auth_policy_json row that allowed the session). Editing, suspending or
+-- deleting the policy ends the elevations it gave.
+--
+-- Numbered 044, following 043_local_users.sql. Safe to run repeatedly.
+
+ALTER TABLE did.sudo_elevations ALTER COLUMN grant_id DROP NOT NULL;
+ALTER TABLE did.sudo_elevations ADD COLUMN IF NOT EXISTS policy_id uuid;
+ALTER TABLE did.sudo_elevations DROP CONSTRAINT IF EXISTS sudo_elevations_source_check;
+ALTER TABLE did.sudo_elevations ADD CONSTRAINT sudo_elevations_source_check
+    CHECK (grant_id IS NOT NULL OR policy_id IS NOT NULL);
+CREATE INDEX IF NOT EXISTS sudo_elevations_by_policy ON did.sudo_elevations (org_id, policy_id)
+    WHERE status IN ('pending', 'active');
+-- ----------------------------------------------------------------------------
+-- 045_ssh_name_login.sql
+-- ----------------------------------------------------------------------------
+
+-- Name logins: `ssh -p 2222 PERSON@ACCOUNT@HOST@GATEWAY`, with no Authnull
+-- certificate and no CLI. The typed person is a claim, so the push to their
+-- phone is the only factor; authn-service always challenges a name login and
+-- limits how many pushes one person can be sent (3 in 5 minutes, and none for
+-- 15 minutes after 3 denied or unanswered in a row), counting from this table.
+--
+-- login is 'name' for those decisions, NULL for certificate logins, so only
+-- name logins are counted.
+--
+-- Numbered 045, following 044_policy_sudo.sql. Safe to run repeatedly.
+
+ALTER TABLE did.ssh_decisions ADD COLUMN IF NOT EXISTS login text;
+CREATE INDEX IF NOT EXISTS ssh_decisions_name_pushes
+    ON did.ssh_decisions (org_id, lower(email), decided_at DESC) WHERE login = 'name';
+-- ----------------------------------------------------------------------------
+-- 046_auto_rotate.sql
+-- ----------------------------------------------------------------------------
+
+-- Take over discovered passwords. When an account scan finds an account with a
+-- password set on an endpoint, its rotation is turned on (its own profile,
+-- every 30 days, the first at once): the password nobody at Authnull knew is
+-- replaced with one only the vault holds. Accounts with no password (key-only,
+-- locked) are left alone; the gateway keeps opening them with session keys.
+--
+-- Never the endpoint's admin account (its vaulted credential would stop
+-- working), root only with auto_rotate_root, never an Authnull-added account
+-- (managed accounts choose for themselves), and never an account whose
+-- rotation an administrator has set or turned off: an own profile in any state
+-- means someone decided.
+--
+-- auto_rotate is on for every endpoint, existing ones included; per endpoint it
+-- can be turned off. password_policies.auto marks a profile the scan created.
+--
+-- Numbered 046, following 045_ssh_name_login.sql. Safe to run repeatedly.
+
+ALTER TABLE did.epm_machines ADD COLUMN IF NOT EXISTS auto_rotate boolean NOT NULL DEFAULT true;
+ALTER TABLE did.epm_machines ADD COLUMN IF NOT EXISTS auto_rotate_root boolean NOT NULL DEFAULT false;
+ALTER TABLE did.password_policies ADD COLUMN IF NOT EXISTS auto boolean NOT NULL DEFAULT false;
+-- ----------------------------------------------------------------------------
+-- 047_mfa_activation_code.sql
+-- ----------------------------------------------------------------------------
+
+-- 047: activation codes for Authenticator invites, and the per-org onboarding invite switch.
+--
+-- Per-org database. Replayed on every start (see docker-compose.yml): everything here is
+-- IF NOT EXISTS.
+--
+-- Activation code: an 8-character code printed in the invite email, so a user without a working
+-- camera can type it into the app instead of scanning the QR. It belongs to the invite row and
+-- so lives and dies with it: it expires with the invite, and a re-sent invite (which marks the
+-- old row used) kills the old code. Only a SHA-256 hash is stored. code_attempts counts wrong
+-- codes entered against the invite; the invite stops accepting codes at 10.
+
+ALTER TABLE did.mfa_device_enrollments
+    ADD COLUMN IF NOT EXISTS activation_code_hash text,
+    ADD COLUMN IF NOT EXISTS code_attempts integer NOT NULL DEFAULT 0;
+
+CREATE UNIQUE INDEX IF NOT EXISTS mfa_device_enrollments_activation_code_uq
+    ON did.mfa_device_enrollments (org_id, activation_code_hash)
+    WHERE activation_code_hash IS NOT NULL AND used = false;
+
+-- Whether creating a user also mails them an Authenticator invite. No row means on.
+CREATE TABLE IF NOT EXISTS did.mfa_onboarding_settings (
+    org_id      integer     PRIMARY KEY,
+    send_invite boolean     NOT NULL DEFAULT true,
+    updated_by  integer,
+    updated_at  timestamptz NOT NULL DEFAULT now()
+);
+-- ----------------------------------------------------------------------------
+-- 048_mfa_campaigns.sql
+-- ----------------------------------------------------------------------------
+
+-- 048: Authenticator enrollment campaigns.
+--
+-- Per-org database. Replayed on every start (see docker-compose.yml): everything here is
+-- IF NOT EXISTS.
+--
+-- A campaign mails an Authenticator invite to a set of users who have no device yet -- every AD
+-- or platform user, the members of some groups, or a list -- and, when it has a deadline, re-sends
+-- the invite on the chosen days before it to whoever still has not enrolled.
+--
+-- mfa_campaign_recipients is both the record of what was sent and the guard against sending it
+-- twice: a send happens only after its (campaign, user, stage) row was inserted, so two replicas
+-- running the daily reminder job cannot both mail the same person.
+
+CREATE TABLE IF NOT EXISTS did.mfa_enrollment_campaigns (
+    id             serial      PRIMARY KEY,
+    org_id         integer     NOT NULL,
+    identity_kind  text        NOT NULL,             -- ad_user | platform_user
+    scope          text        NOT NULL,             -- all | groups | users
+    target_ids     jsonb       NOT NULL DEFAULT '[]', -- group ids or user ids, per scope
+    tenant_id      integer     NOT NULL DEFAULT 0,    -- 0: every tenant
+    deadline       timestamptz,
+    reminder_days  jsonb       NOT NULL DEFAULT '[]', -- days before the deadline
+    status         text        NOT NULL DEFAULT 'running', -- running | done
+    targets        integer     NOT NULL DEFAULT 0,
+    invited        integer     NOT NULL DEFAULT 0,
+    skipped        integer     NOT NULL DEFAULT 0,
+    failed         integer     NOT NULL DEFAULT 0,
+    created_by     integer,
+    created_at     timestamptz NOT NULL DEFAULT now(),
+    finished_at    timestamptz
+);
+
+CREATE INDEX IF NOT EXISTS mfa_enrollment_campaigns_deadline
+    ON did.mfa_enrollment_campaigns (deadline) WHERE deadline IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS did.mfa_campaign_recipients (
+    id           serial      PRIMARY KEY,
+    campaign_id  integer     NOT NULL REFERENCES did.mfa_enrollment_campaigns (id),
+    identity_id  integer     NOT NULL,
+    tenant_id    integer     NOT NULL DEFAULT 0,
+    email        text        NOT NULL,
+    stage        text        NOT NULL, -- invite | reminder:<days before deadline>
+    sent_at      timestamptz NOT NULL DEFAULT now(),
+    error        text
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS mfa_campaign_recipients_once
+    ON did.mfa_campaign_recipients (campaign_id, identity_id, stage);
+-- ----------------------------------------------------------------------------
+-- 049_ad_sensor_credentials.sql
+-- ----------------------------------------------------------------------------
+
+-- 049: per-domain credentials for the AD DC sensor.
+--
+-- Lives in each org's database, like 021_gateway_credentials, and follows the same scheme: a
+-- client id and secret are issued when an admin downloads sensor.yml for a domain, the secret is
+-- stored only as a SHA-256 hash, and the sensor trades the pair for a short-lived bearer token
+-- at /ad/sensor/token.
+--
+-- A domain may hold several live credentials: it usually has several domain controllers, each
+-- running its own sensor with the file downloaded for it. A credential stops working when its
+-- domain is deleted or when revoked_at is set.
+--
+-- Separate from did.gateway_credentials on purpose: those are bound to a PAM jump server, and
+-- the PAM gateway auth path stays untouched.
+--
+-- Replayed on every start (see docker-compose.yml): everything here is IF NOT EXISTS.
+
+CREATE TABLE IF NOT EXISTS did.ad_sensor_credentials (
+    id            serial PRIMARY KEY,
+    org_id        integer     NOT NULL,
+    ad_domain_id  integer     NOT NULL,
+    client_id     text        NOT NULL UNIQUE,
+    secret_hash   text        NOT NULL,
+    created_at    timestamptz NOT NULL DEFAULT now(),
+    created_by    integer,
+    last_used_at  timestamptz,
+    revoked_at    timestamptz
+);
+
+CREATE INDEX IF NOT EXISTS ad_sensor_credentials_domain
+    ON did.ad_sensor_credentials (org_id, ad_domain_id) WHERE revoked_at IS NULL;
+
+CREATE TABLE IF NOT EXISTS did.ad_sensor_tokens (
+    token_hash     text        PRIMARY KEY,
+    credential_id  integer     NOT NULL REFERENCES did.ad_sensor_credentials (id),
+    org_id         integer     NOT NULL,
+    ad_domain_id   integer     NOT NULL,
+    issued_at      timestamptz NOT NULL DEFAULT now(),
+    expires_at     timestamptz NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ad_sensor_tokens_expiry ON did.ad_sensor_tokens (expires_at);
+-- ----------------------------------------------------------------------------
+-- 050_mfa_device_audit.sql
+-- ----------------------------------------------------------------------------
+
+-- 050: audit trail for Authenticator devices and AD sensor credentials.
+--
+-- Per-org database. Replayed on every start (see docker-compose.yml): everything here is
+-- IF NOT EXISTS.
+--
+-- One row per event that changes who can approve sign-ins: a phone enrolled, a phone revoked (by
+-- the user from another phone, or by an admin), an enrollment approved, a sensor credential
+-- revoked. did.audit_log is a sign-in session log (browser, session length) and does not fit.
+
+CREATE TABLE IF NOT EXISTS did.mfa_device_audit (
+    id               bigserial   PRIMARY KEY,
+    org_id           integer     NOT NULL,
+    action           text        NOT NULL, -- enroll | revoke | approve | sensor_credential_revoke
+    device_id        integer,              -- the phone acted on
+    credential_id    integer,              -- the sensor credential acted on
+    actor_kind       text        NOT NULL, -- admin | device | system
+    actor_user_id    integer,              -- did.users.user_id, when an admin acted
+    actor_device_id  integer,              -- the phone that acted, when a device acted
+    ip               text,
+    user_agent       text,
+    reason           text,
+    created_at       timestamptz NOT NULL DEFAULT now()
+);
+
+CREATE INDEX IF NOT EXISTS mfa_device_audit_org_time ON did.mfa_device_audit (org_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS mfa_device_audit_device ON did.mfa_device_audit (device_id) WHERE device_id IS NOT NULL;
+-- ----------------------------------------------------------------------------
+-- 051_mfa_multi_device.sql
+-- ----------------------------------------------------------------------------
+
+-- Authenticator: several phones per account, enrollment without a push token, device metadata.
+--
+-- Idempotent: replayed against the master and every org database on every boot
+-- (see docker-compose.yml).
+
+-- The full (org_id, push_transport, push_token) index is replaced by the partial
+-- mfa_devices_org_transport_live_token_uq, created in 002 (see the note there for why
+-- it lives in that file). Dropped here so a phone can enroll with push_token = ''.
+DROP INDEX IF EXISTS did.mfa_devices_org_transport_token_uq;
+
+-- (org_id, push_token) exists on some databases although no migration creates it (found on
+-- alpha). It is stricter than the partial index, so while it exists the second tokenless phone
+-- in an org fails with a unique violation.
+DROP INDEX IF EXISTS did.mfa_devices_org_token_uq;
+
+-- One identity, one phone, replaced by one link per (identity, device): the
+-- mfa_device_identities_device_uq index created in 002.
+DROP INDEX IF EXISTS did.mfa_device_identities_uq;
+
+ALTER TABLE did.mfa_devices
+    -- Reported by the app at enrollment; shown in the device list.
+    ADD COLUMN IF NOT EXISTS device_model  text NOT NULL DEFAULT '',
+    -- revoked_at set means signed out (by the phone, another phone, an admin or the new-device
+    -- email). is_active only says whether a push can reach the phone: a dead token clears it.
+    ADD COLUMN IF NOT EXISTS revoked_at    timestamptz,
+    ADD COLUMN IF NOT EXISTS revoked_by    integer,
+    ADD COLUMN IF NOT EXISTS revoke_reason text NOT NULL DEFAULT '';
+
+-- Per-org Authenticator settings. An org without a row gets the defaults.
+CREATE TABLE IF NOT EXISTS did.mfa_device_settings (
+    org_id                   integer     PRIMARY KEY,
+    max_devices_per_user     integer     NOT NULL DEFAULT 10
+                             CHECK (max_devices_per_user BETWEEN 1 AND 10),
+    -- Whether the app's own email + password sign-in may add a phone.
+    allow_app_password_login boolean     NOT NULL DEFAULT true,
+    -- The second check before a new phone is added.
+    new_device_check         text        NOT NULL DEFAULT 'email_otp'
+                             CHECK (new_device_check IN ('email_otp', 'sibling', 'admin')),
+    updated_at               timestamptz NOT NULL DEFAULT now()
+);
 
 --
 -- PostgreSQL database dump complete
