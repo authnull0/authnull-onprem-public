@@ -54,6 +54,37 @@ The whole product as Docker containers on one Linux host, behind the host's ngin
    Confirm from the email, then sign in at `/org/login`. Within five minutes the
    organisation's database and its Default tenant are created.
 
+## Keeping secrets in your Vault
+
+By default the secrets Authnull manages (rotated passwords, admin credentials, SSO, SIEM
+and storage credentials) are kept in its database, encrypted with `ENCRYPTION_KEY`. To
+keep them in your HashiCorp Vault or OpenBao instead:
+
+1. In Vault: a KV version 2 mount, a policy, and an AppRole for Authnull.
+
+   ```bash
+   vault policy write authnull - <<'EOF'
+   path "secret/data/authnull/*"     { capabilities = ["create", "read", "update"] }
+   path "secret/metadata/authnull/*" { capabilities = ["delete"] }
+   EOF
+   vault auth enable approle
+   vault write auth/approle/role/authnull token_policies=authnull token_ttl=1h token_max_ttl=4h
+   vault read -field=role_id auth/approle/role/authnull/role-id
+   vault write -f -field=secret_id auth/approle/role/authnull/secret-id
+   ```
+
+2. In `.env`: `VAULT_BACKEND=hashicorp`, `VAULT_ADDR`, `VAULT_APPROLE_ROLE_ID`, and the
+   secret ID, either in `VAULT_APPROLE_SECRET_ID` or in `secrets/vault/secret-id` with
+   `VAULT_APPROLE_SECRET_ID_FILE=/run/secrets/vault/secret-id`. For a private CA, put
+   it at `secrets/vault/ca.pem` and set `VAULT_CACERT=/run/secrets/vault/ca.pem`.
+
+3. `docker compose up -d authnull-service`. The log says
+   `vault: secrets are kept in HashiCorp Vault`. Secrets already in the database are
+   moved to Vault on that start.
+
+Vault must be reachable for anything that uses a secret. Keep `ENCRYPTION_KEY` as it
+is until the log shows nothing left to move.
+
 ## Notes
 
 - On an IP install the tenant URL (`default.<org>.<ip>`) is not a real DNS name.

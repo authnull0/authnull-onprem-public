@@ -134,7 +134,7 @@ mv ssi-config/config.toml.tmp ssi-config/config.toml
 # path; if it does not exist Docker creates a root-owned DIRECTORY there. An empty
 # file is harmless: pushes through Firebase stay off until you put the key here
 # and set FCM_SERVICE_ACCOUNT_JSON=/run/secrets/fcm-service-account.json.
-mkdir -p secrets
+mkdir -p secrets/vault
 chmod 700 secrets
 [ -e secrets/fcm-service-account.json ] || : > secrets/fcm-service-account.json
 chmod 644 secrets/fcm-service-account.json

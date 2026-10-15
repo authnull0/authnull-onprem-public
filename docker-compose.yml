@@ -417,6 +417,18 @@ services:
       AUTH_DISABLED: "false"
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
       TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY}
+      # Where secret values are kept: builtin (the database, under ENCRYPTION_KEY)
+      # or hashicorp (your Vault / OpenBao). See README "Keeping secrets in your Vault".
+      VAULT_BACKEND: ${VAULT_BACKEND:-builtin}
+      VAULT_ADDR: ${VAULT_ADDR:-}
+      VAULT_NAMESPACE: ${VAULT_NAMESPACE:-}
+      VAULT_CACERT: ${VAULT_CACERT:-}
+      VAULT_KV_MOUNT: ${VAULT_KV_MOUNT:-}
+      VAULT_KV_PREFIX: ${VAULT_KV_PREFIX:-}
+      VAULT_APPROLE_MOUNT: ${VAULT_APPROLE_MOUNT:-}
+      VAULT_APPROLE_ROLE_ID: ${VAULT_APPROLE_ROLE_ID:-}
+      VAULT_APPROLE_SECRET_ID: ${VAULT_APPROLE_SECRET_ID:-}
+      VAULT_APPROLE_SECRET_ID_FILE: ${VAULT_APPROLE_SECRET_ID_FILE:-}
       JWT_SECRET: ${JWT_SECRET}
       DID_SERVICE_ADDR: ssi-service:50051
       SSI_SERVICE: http://ssi-service:5000
@@ -563,6 +575,10 @@ services:
       - authnull-uploads:/var/authnull/uploads
       - authnull-recordings:/var/authnull/recordings
       - siem-outputs:/var/authnull/siem-outputs
+      # Vault's AppRole secret ID and CA certificate, when you keep them in files:
+      # VAULT_APPROLE_SECRET_ID_FILE=/run/secrets/vault/secret-id,
+      # VAULT_CACERT=/run/secrets/vault/ca.pem. setup.sh creates the directory.
+      - ./secrets/vault:/run/secrets/vault:ro
       # Firebase service account for push MFA, read-only.
       #
       # A bind-mounted FILE, kept out of .env and out of git: a
