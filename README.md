@@ -1,0 +1,66 @@
+# Authnull on-prem
+
+The whole product as Docker containers on one Linux host, behind the host's nginx.
+
+## Needs
+
+- Docker with the compose plugin, `openssl`, and nginx on the host.
+- An SMTP server. Sign-up emails a verification link, and setting up a new
+  organisation emails its admin; without SMTP neither finishes.
+- For a domain install over HTTPS: nginx 1.19.4 or newer (`nginx/nginx.conf`
+  uses `ssl_reject_handshake`) and a certificate for the domain.
+
+## Install
+
+1. Create `.env` and the ssi-service config. Every secret is generated for this
+   install; nothing is shared with any other install.
+
+   ```bash
+   ./setup.sh --address 10.0.0.5 --org acme
+   ```
+
+   Use `--address pam.example.com --https` for a domain. Run with no options to
+   be asked instead. It never overwrites an existing `.env`.
+
+2. **Back up `.env`.** It holds this install's secrets, and `ENCRYPTION_KEY` is
+   the only way to read the vault. Lose it and stored passwords are gone.
+
+3. Fill in `SMTP_HOST`, `SMTP_PORT`, `SMTP_FROM` and `SMTP_PASSWORD` in `.env`.
+
+4. Start it:
+
+   ```bash
+   docker compose up -d
+   ```
+
+   The first start loads the database schema from `db-init/` and takes a few
+   minutes.
+
+5. Put nginx in front. The files in `nginx/` are whole `nginx.conf` files. Remove
+   Ubuntu's default site too, or nginx refuses to start with "duplicate default
+   server":
+
+   ```bash
+   sudo cp /etc/nginx/nginx.conf /etc/nginx/nginx.conf.orig
+   sudo cp nginx/nginx-ip.conf /etc/nginx/nginx.conf
+   sudo rm /etc/nginx/sites-enabled/default
+   sudo nginx -t && sudo systemctl reload nginx
+   ```
+
+   For a domain, use `nginx/nginx.conf` instead and set the domain and
+   certificate paths in it.
+
+6. Open `http://<address>/org/signup` and register the organisation's admin.
+   Confirm from the email, then sign in at `/org/login`. Within five minutes the
+   organisation's database and its Default tenant are created.
+
+## Notes
+
+- On an IP install the tenant URL (`default.<org>.<ip>`) is not a real DNS name.
+  The organisation console works on the IP; to use the tenant URL, add it to DNS
+  or to the hosts file of the machines that use it.
+- Audit events go to Fluent Bit (`fluent-bit` service). SIEM outputs configured
+  in the console are written to the `authnull-siem-outputs` volume and loaded by
+  Fluent Bit without a restart.
+- Phone pushes through Firebase are off until you put the service account key at
+  `secrets/fcm-service-account.json` and set `FCM_SERVICE_ACCOUNT_JSON` in `.env`.

@@ -1,3 +1,6 @@
+# ssi-service configuration TEMPLATE. setup.sh renders config.toml from it with
+# this install's Redis password and a generated keystore password; the
+# rendered file is mounted over the one baked into the image. Never commit it.
 title = "SSI Service Config"
 
 svn = "0.0.1"
@@ -27,12 +30,12 @@ storage = "redis"
 
 [services.storage_option]
 address = "redis:6379"
-password = "__REDIS_PASSWORD__"
+password = "@@REDIS_PASSWORD@@"
 
 # per-service configuration
 [services.keystore]
 name = "keystore"
-password = "__REDIS_PASSWORD__"
+password = "@@SSI_KEYSTORE_PASSWORD@@"
 
 [services.did]
 name = "did"

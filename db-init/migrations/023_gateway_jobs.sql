@@ -52,18 +52,8 @@ CREATE TABLE IF NOT EXISTS did.gateway_jobs (
     created_at       timestamptz NOT NULL DEFAULT now()
 );
 
--- did-schema-init replays every migration on each `up`. 024 replaces this index
--- with a per-account one and allows two open jobs per endpoint and kind, so
--- recreating it on a replay would fail on that data and stop the stack. Only
--- create it while 024's index does not exist yet.
-DO $$
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_indexes
-                   WHERE schemaname = 'did' AND indexname = 'gateway_jobs_one_open_per_account') THEN
-        CREATE UNIQUE INDEX IF NOT EXISTS gateway_jobs_one_open
-            ON did.gateway_jobs (org_id, endpoint_id, kind) WHERE status IN ('queued', 'claimed');
-    END IF;
-END $$;
+CREATE UNIQUE INDEX IF NOT EXISTS gateway_jobs_one_open
+    ON did.gateway_jobs (org_id, endpoint_id, kind) WHERE status IN ('queued', 'claimed');
 
 CREATE INDEX IF NOT EXISTS gateway_jobs_for_gateway
     ON did.gateway_jobs (org_id, jump_server_id, status, created_at);

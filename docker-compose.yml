@@ -66,6 +66,12 @@ volumes:
   auth-log-volume:
   cassandra-data:
   es-data:
+  # SIEM outputs, one file per tenant, written by authnull-service from Logs
+  # Config and read by fluent-bit. Named so a separate fluent-bit stack can join it.
+  siem-outputs:
+    name: authnull-siem-outputs
+  # Events waiting for an unreachable SIEM, on disk.
+  fluent-bit-buffer:
 
 services:
 
@@ -248,6 +254,10 @@ services:
   ssi-service:
     <<: *restart
     image: docker-repo-public.authnull.com/ssi-service:1.0.0-onprem
+    # The image ignores the *_PASSWORD variables below and reads its passwords
+    # from /app/config/config.toml; mount this install's, rendered by setup.sh.
+    volumes:
+      - ./ssi-config/config.toml:/app/config/config.toml:ro
     ports:
       - "127.0.0.1:5000:5000"
     environment:
@@ -296,6 +306,8 @@ services:
       #service
       SERVER_PORT: "2882"
       SERVER_BASEPATH: "/authnull0"
+      # SSH decisions are answered only for a gateway presenting its own token.
+      SSH_REQUIRE_GATEWAY_TOKEN: "true"
       # NOTE: hardcoded broker on AuthNull's network; the KAFKA_* values in .env
       # are ignored. Ask AuthNull whether this should be ${KAFKA_BROKERS}.
       KAFKA_BROKERS: "10.104.14.189:9092"
@@ -484,6 +496,16 @@ services:
       AZURE_STORAGE_KEY: ${AZURE_STORAGE_KEY}
       AZURE_CONTAINER_NAME: ${AZURE_CONTAINER_NAME}
       FLUENT_LOG_PATH: /var/log/authnull/auth.log
+      # SIEM delivery through fluent-bit (defined below): events in, outputs
+      # rendered per tenant from Logs Config, then a hot reload.
+      FLUENTBIT_URL: http://fluent-bit:9880
+      FLUENTBIT_RELOAD_URL: http://fluent-bit:2020/api/v2/reload
+      SIEM_OUTPUTS_DIR: /var/authnull/siem-outputs
+      # Gateways authenticate with their own tokens, never the internal key.
+      GATEWAY_ALLOW_INTERNAL_KEY: "false"
+      # Console single sign-on (OIDC / GitHub): where providers send users back.
+      SSO_CALLBACK_URL: ${SSO_CALLBACK_URL}
+      SSO_CONSOLE_DOMAIN: ${SSO_CONSOLE_DOMAIN}
       LOGGER_PATH: /var/log/authnull/audit.log
       ETHEREUM_URL: ${ETHEREUM_URL}
       REDIS_PORT: ${REDIS_PORT:-6379}
@@ -540,9 +562,10 @@ services:
       - authnull-logs:/var/log/authnull
       - authnull-uploads:/var/authnull/uploads
       - authnull-recordings:/var/authnull/recordings
+      - siem-outputs:/var/authnull/siem-outputs
       # Firebase service account for push MFA, read-only.
       #
-      # A bind-mounted FILE, not the inline JSON in .env: .env is committed in this repo, and a
+      # A bind-mounted FILE, kept out of .env and out of git: a
       # Firebase key cannot be scoped down -- it grants send-to-any-device across the whole
       # project, so it must not enter git. ./secrets is gitignored.
       #
@@ -744,17 +767,52 @@ services:
       - authnull
 
 
+  # ---------------------------------------------------------------------------
+  # Fluent Bit: security events to each tenant's SIEM (Settings > Logs Config)
+  #
+  #   authnull-service --POST /siem.<org>.ssh--> fluent-bit --> Splunk / syslog / HTTP / Elasticsearch
+  #
+  # authnull-service is the only sender and writes the outputs; nothing here is
+  # edited by hand. No ports are published: 9880 (events) and 2020 (reload API)
+  # are reachable only on the stack's network.
+  # ---------------------------------------------------------------------------
+  # fluent-bit refuses to start with an empty outputs directory, and on a fresh
+  # install authnull-service has not written one yet: leave a placeholder.
+  fluent-bit-outputs-init:
+    image: busybox:1.36
+    restart: "no"
+    command:
+      - sh
+      - -c
+      - 'ls /outputs/*.conf >/dev/null 2>&1 || printf "# No SIEM outputs yet. authnull-service writes one file per tenant here from Logs Config.\n" > /outputs/00-placeholder.conf'
+    volumes:
+      - siem-outputs:/outputs
+    network_mode: none
+
+  fluent-bit:
+    <<: *restart
+    image: fluent/fluent-bit:4.0.14
+    depends_on:
+      fluent-bit-outputs-init:
+        condition: service_completed_successfully
+    volumes:
+      - ./fluent-bit/fluent-bit.conf:/fluent-bit/etc/fluent-bit.conf:ro
+      - siem-outputs:/fluent-bit/etc/outputs:ro
+      - fluent-bit-buffer:/buffer
+    networks:
+      - authnull
+
 # =============================================================================
 # STILL OPEN — decide and edit yourself:
 #
-# 1. .env is missing JWT_SECRET, INTERNAL_API_KEY and GIN_MODE=release.
-#    Generate the secrets with:  openssl rand -hex 32
+# 1. DONE: secrets are generated per install by ./setup.sh into .env
+#    (never committed; see .env.example for every setting).
 #
 # 2. TWILIO_FROM_NUMBER is read by authnull-service but .env only has
 #    TWILIO_PHONE. Add TWILIO_FROM_NUMBER to .env if you use SMS.
 #
-# 3. SSC_SIGNIN_URL, CLIENT_URL, SSC_BASE_URL, AUTHNULL_LOGOUT_URL and ROOT_URL
-#    are NOT in .env yet. All must point at THIS deployment, or the UI has no
+# 3. DONE: SSC_SIGNIN_URL, CLIENT_URL, SSC_BASE_URL, AUTHNULL_LOGOUT_URL and
+#    ROOT_URL are in .env.example and asked for (from the domain) by ./setup.sh. All must point at THIS deployment, or the UI has no
 #    working sign-in / logout target.
 #
 # 4. 8080, 3000 and 5173 are still published on all interfaces (UI / API).
