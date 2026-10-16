@@ -29,7 +29,9 @@ ALTER TABLE did.epm_machines ADD COLUMN IF NOT EXISTS admin_account text;
 ALTER TABLE did.vault_secrets DROP CONSTRAINT IF EXISTS vault_secrets_kind_check;
 ALTER TABLE did.vault_secrets ADD CONSTRAINT vault_secrets_kind_check
     CHECK (kind IN ('reconcile_key', 'grant_password', 'grant_key', 'storage_credential', 'siem_credential',
-                    'account_password', 'account_password_staged', 'sso_client_secret', 'admin_credential'));
+                    'account_password', 'account_password_staged', 'sso_client_secret', 'admin_credential',
+                    -- 053: the organisation's SSH user CA private key.
+                    'ssh_user_ca'));
 
 ALTER TABLE did.gateway_jobs DROP CONSTRAINT IF EXISTS gateway_jobs_kind_check;
 ALTER TABLE did.gateway_jobs ADD CONSTRAINT gateway_jobs_kind_check
