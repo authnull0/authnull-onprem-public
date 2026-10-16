@@ -353,6 +353,27 @@ services:
       ENCRYPTION_KEY: ${ENCRYPTION_KEY}
       TOTP_ENCRYPTION_KEY: ${TOTP_ENCRYPTION_KEY}
       #
+      # authn-service is the only MFA engine: it decides and sends every push (AD, RADIUS, SSH,
+      # database, console sign-in, PAM reveal) and verifies console TOTP and passkeys. These must
+      # equal authnull-service's values -- a different WEBAUTHN_RP_ID invalidates every passkey.
+      WEBAUTHN_RP_NAME: ${WEBAUTHN_RP_NAME}
+      WEBAUTHN_RP_ID: ${WEBAUTHN_RP_ID}
+      WEBAUTHN_ORIGIN: ${WEBAUTHN_ORIGIN}
+      # The API root the phone calls back (getChallenge / respond), carried in every push.
+      API_BASE_URL: ${API_BASE_URL:-${SYSTEM_URL}}
+      MFA_PUSH_CHALLENGE_TTL_SEC: ${MFA_PUSH_CHALLENGE_TTL_SEC}
+      # AuthNull Authenticator delivery. Same key file as authnull-service, mounted below.
+      FCM_SERVICE_ACCOUNT_JSON: ${FCM_SERVICE_ACCOUNT_JSON}
+      FCM_PROJECT_ID: ${FCM_PROJECT_ID}
+      EXPO_ACCESS_TOKEN: ${EXPO_ACCESS_TOKEN}
+      # Fallback Duo / Okta credentials, used only when an org's provider row leaves a field
+      # empty. Moved here from authnull-service, which no longer sends vendor pushes.
+      DUO_IKEY: ${DUO_IKEY}
+      DUO_SKEY: ${DUO_SKEY}
+      DUO_HOST: ${DUO_HOST}
+      OKTA_DOMAIN: ${OKTA_DOMAIN}
+      OKTA_API_TOKEN: ${OKTA_API_TOKEN}
+      #
       # Unset deliberately: no SsoLogin route survives in either repo, so there is nothing to point
       # this at. CallSsoLogin now fails as "not configured" instead of calling a dead host -- if
       # that arm turns out to still be needed, it needs an implementation, not an address.
@@ -366,6 +387,8 @@ services:
       RISK_API_INTERNAL: http://aipolicyagent:8002/api/v1/ai
     volumes:
       - auth-log-volume:/logs
+      # Firebase key for Authenticator pushes; see authnull-service's mount for why it is a file.
+      - ./secrets/fcm-service-account.json:/run/secrets/fcm-service-account.json:ro
     networks:
       - authnull
 
@@ -432,7 +455,11 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       DID_SERVICE_ADDR: ssi-service:50051
       SSI_SERVICE: http://ssi-service:5000
-      AUTHN_SERVICE_URL: http://authn-service:2882
+      # authn-service's API base. authnull-service forwards console sign-in MFA (decide, TOTP,
+      # passkey, push) and the SSO / Entra external-MFA checks here and appends the route itself
+      # (/v4/console/..., /v4/challenge/..., /v3/do-authenticationV4), so the path is part of it.
+      # Without the path every console MFA check is a 404 and sign-in fails closed with 503.
+      AUTHN_SERVICE_URL: http://authn-service:2882/authnull0/api/v1/authn
       UI_URL: http://ui:3000
       SMTP_HOST: ${SMTP_HOST}
       SMTP_PORT: ${SMTP_PORT}
@@ -445,11 +472,6 @@ services:
       VERIFY_URL: ${SYSTEM_URL}/api/v1/tenants/orgsignupverify
       OKTA_IDP_METADATA_URL: ${OKTA_IDP_METADATA_URL}
       MFA_PROVIDER: ${MFA_PROVIDER}
-      DUO_IKEY: ${DUO_IKEY}
-      DUO_SKEY: ${DUO_SKEY}
-      DUO_HOST: ${DUO_HOST}
-      OKTA_DOMAIN: ${OKTA_DOMAIN}
-      OKTA_API_TOKEN: ${OKTA_API_TOKEN}
       TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID}
       TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN}
       TWILIO_FROM_NUMBER: ${TWILIO_FROM_NUMBER}
@@ -528,7 +550,6 @@ services:
       APP_IOS_URL: ${APP_IOS_URL}
       APP_ANDROID_URL: ${APP_ANDROID_URL}
       LOGGING_URL: ${LOGGING_URL}
-      SSO_VERIFICATION_URL: ${SSO_VERIFICATION_URL}
       VAULT_SERVICE_URL: ${VAULT_SERVICE_URL}
       TENANT_SERVICE_URL: ${TENANT_SERVICE_URL}
       # --- vars the code reads that were previously never passed through -------
@@ -557,13 +578,8 @@ services:
       # nothing at all and an operator overriding it would have seen no effect.
       API_BASE_URL: ${API_BASE_URL}
       AD_SERVICE_URL: ${SYSTEM_URL}
-      POLICY_SERVICE_URL: ${SYSTEM_URL}
       # (CREATE_AD_USER_CREDENTIAL_V2 / CREATE_SHARED_AD_USER_CREDENTIAL removed --
       # the ad module now calls the issuer directly instead of over loopback HTTP.)
-      # authn-service base; the code appends
-      # /authnull0/api/v1/authn/v3/do-authenticationV4. Unset, it fell back to
-      # http://onprem.authnull.com.
-      DO_AUTHNV4: http://authn-service:2882
       SMTP_BCC: ${SMTP_BCC}
       # pam file-upload storage (restored: the standalone service read these
       # directly, and conf.applyEnvOverrides now bridges them into Viper).
