@@ -432,7 +432,7 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       DID_SERVICE_ADDR: ssi-service:50051
       SSI_SERVICE: http://ssi-service:5000
-      AUTHN_SERVICE_URL: http://authn-service:2882
+      AUTHN_SERVICE_URL: http://authn-service:2882/authnull0/api/v1/authn
       UI_URL: http://ui:3000
       SMTP_HOST: ${SMTP_HOST}
       SMTP_PORT: ${SMTP_PORT}
