@@ -243,38 +243,6 @@ services:
       - authnull
 
   # ---------------------------------------------------------------------------
-  # ssi-service — DID / SSI / credential engine  (--profile ssi)
-  # ---------------------------------------------------------------------------
-  ssi-service:
-    <<: *restart
-    image: docker-repo-public.authnull.com/ssi-service:1.0.0-onprem
-    ports:
-      - "127.0.0.1:5000:5000"
-    environment:
-      DB_HOST: ${DB_HOST}
-      DB_PORT: ${DB_PORT}
-      DB_USER: ${DB_USER}
-      DB_PASSWORD: ${DB_PASSWORD}
-      DB_NAME: ${DB_NAME}
-      DB_SCHEMA: ${DB_SCHEMA}
-      #service
-      # Was "0.0.0.0:6379": inside a container that is the container itself,
-      # not the redis service. Redis is reachable by its service name.
-      SERVICES_STORAGE_PROVIDER: redis
-      SERVICES_STORAGE_ADDRESS: "redis:6379"
-      SERVICES_STORAGE_PASSWORD: "${REDIS_PASSWORD}"
-      # Alternative format seen in logs
-      STORAGE_PROVIDER: redis
-      STORAGE_ADDRESS: "redis:6379"
-      STORAGE_PASSWORD: "${REDIS_PASSWORD}"
-      # Redis config
-      REDIS_HOST: redis
-      REDIS_PORT: "6379"
-      REDIS_PASSWORD: ${REDIS_PASSWORD}
-    networks:
-      - authnull
-
-  # ---------------------------------------------------------------------------
   # authn-service — full auth engine  (--profile authn)
   # ---------------------------------------------------------------------------
   authn-service:
@@ -408,7 +376,10 @@ services:
       JWT_SECRET: ${JWT_SECRET}
       DID_SERVICE_ADDR: ssi-service:50051
       SSI_SERVICE: http://ssi-service:5000
-      AUTHN_SERVICE_URL: http://authn-service:2882
+      # authn-service mounts its routes under SERVER_BASEPATH + /api/v1/authn, and the
+      # code appends /v4/console/... to this. Without the prefix every console MFA
+      # decision gets "404 page not found" and sign-in answers 503.
+      AUTHN_SERVICE_URL: http://authn-service:2882/authnull0/api/v1/authn
       UI_URL: http://ui:3000
       SMTP_HOST: ${SMTP_HOST}
       SMTP_PORT: ${SMTP_PORT}
@@ -655,53 +626,6 @@ services:
     networks:
       - authnull
 
-  transaction-log-daemon:
-    <<: *restart
-    image: docker-repo-public.authnull.com/transaction-log-daemon:1.0.0
-    ports:
-      - "127.0.0.1:8087:8080"
-    environment:
-      SERVER_PORT: "8080"
-      CRON_TIME: "1h"
-      # Postgres config
-      DB_HOST: ${DB_HOST}
-      DB_PORT: ${DB_PORT}
-      DB_USER: ${DB_USER}
-      DB_PASSWORD: ${DB_PASSWORD}
-      DB_NAME: ${DB_NAME}
-      DB_SCHEMA: ${DB_SCHEMA}
-    depends_on:
-      did-schema-init:
-        condition: service_completed_successfully
-    networks:
-      - authnull
-
-  blockchain-ipfs-logging:
-    <<: *restart
-    image: docker-repo-public.authnull.com/blockchain-ipfs-logging:1.0.0
-    ports:
-      - "127.0.0.1:6065:6065"
-    environment:
-      SERVER_PORT: "6065"
-      CORS_ALLOW_ORIGIN: "*"
-      OKTA_APP: https://dev-10065336.okta.com/app/dev-10065336_appauth_1/exk9qlowj2pMhgIgL5d7/sso/saml
-      # Postgres config (was hardcoded kloudone / authnull_dev, which do not
-      # exist on this Postgres)
-      DB_HOST: ${DB_HOST}
-      DB_PORT: ${DB_PORT}
-      DB_USER: ${DB_USER}
-      DB_PASSWORD: ${DB_PASSWORD}
-      DB_NAME: ${DB_NAME}
-      DB_SCHEMA: ${DB_SCHEMA}
-      # SMTP config
-      SMTP_HOST: ${SMTP_HOST}
-      SMTP_PORT: ${SMTP_PORT}
-      SMTP_FROM: ${SMTP_FROM}
-      SMTP_PASSWORD: ${SMTP_PASSWORD}
-      #Internal Service
-      AUTHNZ_URL: http://authnz:6066/authnz/authenticate
-    networks:
-      - authnull
 
   cassandra:
     <<: *restart
