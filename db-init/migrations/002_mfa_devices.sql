@@ -62,8 +62,20 @@ CREATE TABLE IF NOT EXISTS did.mfa_devices (
 -- A token identifies a device only within its transport, so the triple is the
 -- key. This is the constraint CompleteEnrollment upserts against to collapse a
 -- second enrolment of the same phone onto the existing row.
-CREATE UNIQUE INDEX IF NOT EXISTS mfa_devices_org_transport_token_uq
-    ON did.mfa_devices (org_id, push_transport, push_token);
+--
+-- Partial: a phone may enroll before it has a push token (push_token = ''), and two
+-- such phones are different devices, not one. This replaced the full index
+-- mfa_devices_org_transport_token_uq, which 046 drops. It is created HERE, not in 046,
+-- because the backfills below rely on it to skip duplicates, and because this file is
+-- replayed on every boot: re-creating the old full index here would fail the replay as
+-- soon as two tokenless phones exist.
+--
+-- The backfills use ON CONFLICT DO NOTHING without a target, so they skip a row that
+-- clashes with ANY unique index. On the first boot after an upgrade the old and new
+-- indexes both exist until 046 runs, and a target naming only one of them would fail on
+-- the other.
+CREATE UNIQUE INDEX IF NOT EXISTS mfa_devices_org_transport_live_token_uq
+    ON did.mfa_devices (org_id, push_transport, push_token) WHERE push_token <> '';
 
 -- ── identity links ─────────────────────────────────────────────────────────
 
@@ -82,10 +94,12 @@ CREATE TABLE IF NOT EXISTS did.mfa_device_identities (
     created_at    timestamptz NOT NULL DEFAULT now()
 );
 
--- One identity points at exactly one device: re-enrolling on a new phone
--- re-points the link rather than accumulating stale devices.
-CREATE UNIQUE INDEX IF NOT EXISTS mfa_device_identities_uq
-    ON did.mfa_device_identities (org_id, identity_kind, identity_id);
+-- One link per (identity, device): an identity may have several phones. This replaced
+-- mfa_device_identities_uq on (org_id, identity_kind, identity_id), under which a new phone
+-- re-pointed the identity and signed the old one out; 046 drops it. Created here rather than
+-- in 046 for the same replay reason as the token index above.
+CREATE UNIQUE INDEX IF NOT EXISTS mfa_device_identities_device_uq
+    ON did.mfa_device_identities (org_id, identity_kind, identity_id, device_id);
 
 CREATE INDEX IF NOT EXISTS mfa_device_identities_email_idx
     ON did.mfa_device_identities (org_id, lower(email));
@@ -137,7 +151,7 @@ BEGIN
            d.last_used_at
     FROM did.ad_user_devices d
     WHERE d.expo_push_token IS NOT NULL AND d.expo_push_token <> ''
-    ON CONFLICT (org_id, push_transport, push_token) DO NOTHING;
+    ON CONFLICT DO NOTHING;
 
     INSERT INTO did.mfa_device_identities (device_id, org_id, tenant_id, identity_kind, identity_id, email, created_at)
     SELECT nd.id,
@@ -151,7 +165,7 @@ BEGIN
     JOIN did.mfa_devices nd
       ON nd.org_id = d.org_id AND nd.push_transport = 'expo' AND nd.push_token = d.expo_push_token
     WHERE d.expo_push_token IS NOT NULL AND d.expo_push_token <> ''
-    ON CONFLICT (org_id, identity_kind, identity_id) DO NOTHING;
+    ON CONFLICT DO NOTHING;
 END $$;
 
 -- ── backfill: platform devices ─────────────────────────────────────────────
@@ -180,7 +194,7 @@ BEGIN
     WHERE m.method_type = 'push'
       AND u.org_id IS NOT NULL
       AND COALESCE(m.method_data->>'expo_push_token', '') <> ''
-    ON CONFLICT (org_id, push_transport, push_token) DO NOTHING;
+    ON CONFLICT DO NOTHING;
 
     INSERT INTO did.mfa_device_identities (device_id, org_id, tenant_id, identity_kind, identity_id, email, created_at)
     SELECT nd.id,
@@ -197,7 +211,7 @@ BEGIN
     WHERE m.method_type = 'push'
       AND u.org_id IS NOT NULL
       AND COALESCE(m.method_data->>'expo_push_token', '') <> ''
-    ON CONFLICT (org_id, identity_kind, identity_id) DO NOTHING;
+    ON CONFLICT DO NOTHING;
 END $$;
 
 -- NOTE: the old columns are intentionally left in place. did.ad_user_devices and

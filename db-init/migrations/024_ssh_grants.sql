@@ -58,9 +58,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ssh_grants_one_live
 
 CREATE INDEX IF NOT EXISTS ssh_grants_by_policy ON did.ssh_grants (org_id, policy_id);
 
-ALTER TABLE did.gateway_jobs DROP CONSTRAINT IF EXISTS gateway_jobs_kind_check;
-ALTER TABLE did.gateway_jobs ADD CONSTRAINT gateway_jobs_kind_check
-    CHECK (kind IN ('scan_accounts', 'rotate_credential', 'revoke_credential'));
+-- gateway_jobs_kind_check is owned by 042_admin_account.sql; see the note there.
 
 DROP INDEX IF EXISTS did.gateway_jobs_one_open;
 CREATE UNIQUE INDEX IF NOT EXISTS gateway_jobs_one_open_per_account

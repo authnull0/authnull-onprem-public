@@ -76,7 +76,7 @@ services:
     <<: *restart
     image: postgres:16-alpine
     ports:
-      - "127.0.0.1:5432:5432"
+      - "5432:5432"
     environment:
       POSTGRES_USER: ${DB_USER}
       POSTGRES_DB: ${DB_NAME}
@@ -192,7 +192,7 @@ services:
     <<: *restart
     image: redis:7-alpine
     ports:
-      - "127.0.0.1:6379:6379"
+      - "6379:6379"
     command: redis-server --requirepass ${REDIS_PASSWORD} --appendonly yes
     environment:
       REDIS_REPLICATION_MODE: master
@@ -217,7 +217,7 @@ services:
     <<: *restart
     image: docker-repo-public.authnull.com/authnz:1.0.0
     ports:
-      - "127.0.0.1:6066:6066"
+      - "6066:6066"
     environment:
       SERVER_PORT: "6066"
       # Postgres config
@@ -249,7 +249,7 @@ services:
     <<: *restart
     image: docker-repo-public.authnull.com/authn-service:2.0.0
     ports:
-      - "127.0.0.1:2882:2882"
+      - "2882:2882"
     environment:
       # Postgres config
       DB_HOST: ${DB_HOST}
@@ -587,7 +587,7 @@ services:
     <<: *restart
     image: docker-repo-public.authnull.com/secret-management-service:1.0.0
     ports:
-      - "127.0.0.1:9291:9291"
+      - "9291:9291"
     environment:
       SERVER_PORT: "9291"
       # Postgres config
@@ -607,7 +607,7 @@ services:
     <<: *restart
     image: docker-repo-public.authnull.com/log-service:1.0.0
     ports:
-      - "127.0.0.1:9255:9255"
+      - "9255:9255"
     environment:
       SERVER_PORT: "9255"
       IPINFO_TOKEN: ${IPINFO_TOKEN}
@@ -631,7 +631,7 @@ services:
     <<: *restart
     image: cassandra:3.11
     ports:
-      - "127.0.0.1:9042:9042"
+      - "9042:9042"
     environment:
       CASSANDRA_CLUSTER_NAME: temporal
       CASSANDRA_DC: datacenter1
